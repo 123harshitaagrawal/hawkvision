@@ -38,6 +38,7 @@ from trajectory_tracker import (
     CricketTrajectoryPredictor,
     pass_b_refine_window,
     is_delivery_candidate_cluster,
+    should_fallback_to_coarse_window,
     detect_faces_fast
 )
 from server import (
@@ -206,6 +207,79 @@ class TestHawkVisionRobustness(unittest.TestCase):
         nets_ball_bh = 32.0
         nets_ball_accepted = (nets_ball_bw <= max_bw and nets_ball_bh <= max_bh)
         self.assertTrue(nets_ball_accepted, "Indoor nets ball (32x32) must pass bbox ceiling")
+
+    def test_indoor_nets_fallback_stays_wide(self):
+        """
+        Validates indoor nets clip behavior:
+        When a coarse window is wide (e.g. 120 frames) but the refined window is short
+        AND low-quality (e.g. sporadic detections, conf < 0.55 or r2 < 0.35 or detected_points < 5),
+        it must fall back to the coarse window, preserving the full slow-motion delivery.
+        """
+        fps = 30.0
+        cs = 68
+        ce = 188  # coarse_duration = 120 frames (4.0s)
+
+        # Refined window is short (27 frames = 0.9s < fps * 1.2 = 36s, and 27 < 0.35 * 120 = 42)
+        # AND low quality (detected_points=3 < 5, parabola_r2=0.22 < 0.35, conf=0.48 < 0.55)
+        low_quality_refined = {
+            "start_frame": 80,
+            "end_frame": 107,
+            "flight_start_frame": 80,
+            "flight_end_frame": 107,
+            "detected_points": 3,
+            "parabola_r2": 0.22,
+            "confidence": 0.48
+        }
+
+        should_fallback = should_fallback_to_coarse_window(low_quality_refined, cs, ce, fps)
+        self.assertTrue(should_fallback,
+                        "Indoor nets clip with low-quality sporadic detection must fall back to coarse window")
+
+        # Verify fallback window spans the full coarse duration
+        fallback_window = {
+            "start_frame": cs,
+            "end_frame": ce,
+            "flight_start_frame": low_quality_refined["flight_start_frame"],
+            "flight_end_frame": low_quality_refined["flight_end_frame"],
+            "detected_points": low_quality_refined["detected_points"],
+            "parabola_r2": low_quality_refined["parabola_r2"],
+            "confidence": 0.50
+        }
+        duration = fallback_window["end_frame"] - fallback_window["start_frame"]
+        self.assertEqual(duration, 120, "Indoor nets window must stay wide at full coarse duration (120 frames)")
+
+    def test_talk_shot_talk_tight_trim(self):
+        """
+        Validates talk-shot-talk clip behavior:
+        When a coarse window is wide because it includes bowler talking/walking before/after (e.g. 250 frames),
+        but Pass B finds a tight, high-confidence delivery (conf >= 0.55, r2 >= 0.35, detected_points >= 5),
+        it MUST NOT fall back to coarse; it must trust the tight refined window and trim out the talking.
+        """
+        fps = 30.0
+        cs = 50
+        ce = 300  # coarse_duration = 250 frames (8.33s, includes talking before and after)
+
+        # Refined window is short (30 frames = 1.0s) but HIGH quality
+        # (detected_points=12 >= 5, parabola_r2=0.86 >= 0.35, conf=0.84 >= 0.55)
+        high_quality_refined = {
+            "start_frame": 150,
+            "end_frame": 180,
+            "flight_start_frame": 150,
+            "flight_end_frame": 180,
+            "detected_points": 12,
+            "parabola_r2": 0.86,
+            "confidence": 0.84
+        }
+
+        should_fallback = should_fallback_to_coarse_window(high_quality_refined, cs, ce, fps)
+        self.assertFalse(should_fallback,
+                         "Talk-shot-talk clip with high-confidence delivery must NOT fall back; must trim tightly")
+
+        # Verify window remains tightly trimmed to the genuine delivery
+        trimmed_duration = high_quality_refined["end_frame"] - high_quality_refined["start_frame"]
+        self.assertEqual(trimmed_duration, 30, "Talk-shot-talk clip must remain tightly trimmed to 30 frames (1.0s)")
+        self.assertEqual(high_quality_refined["start_frame"], 150)
+        self.assertEqual(high_quality_refined["end_frame"], 180)
 
 
 if __name__ == '__main__':

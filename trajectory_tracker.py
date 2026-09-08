@@ -395,6 +395,26 @@ def pass_b_refine_window(cap, model, c_start, c_end, fps, conf_thresh=0.15):
     return refined, had_rejected
 
 
+def should_fallback_to_coarse_window(r, coarse_start, coarse_end, fps):
+    """
+    Evaluates whether a refined delivery window should fall back to its parent Pass A coarse window.
+    Only falls back when the refined result is both short AND low-quality (e.g. indoor nets with sporadic tracking).
+    If the refined delivery has high confidence, good parabola fit, and sufficient detected points,
+    the tight window is trusted as-is (e.g. talk-shot-talk clip trimming out talking before/after).
+    """
+    coarse_duration = max(1, coarse_end - coarse_start)
+    refined_duration = max(1, r.get('end_frame', coarse_end) - r.get('start_frame', coarse_start))
+
+    is_low_quality = (
+        r.get("confidence", 1.0) < 0.55
+        or r.get("parabola_r2", 1.0) < 0.35
+        or r.get("detected_points", 999) < 5
+    )
+
+    is_short = (refined_duration < 0.35 * coarse_duration and refined_duration < fps * 1.2)
+    return is_short and is_low_quality
+
+
 def segment_deliveries(video_path, model=None, conf_thresh=0.15, task_id='session', debug=False, progress_callback=None):
     """
     Two-Stage Multi-Delivery Auto-Segmentation Pipeline.
@@ -444,7 +464,20 @@ def segment_deliveries(video_path, model=None, conf_thresh=0.15, task_id='sessio
             any_rejected = True
 
         for r in (res or []):
-            all_refined.append(r)
+            if should_fallback_to_coarse_window(r, cs, ce, fps):
+                refined_dur = r.get('end_frame', ce) - r.get('start_frame', cs)
+                print(f"[Segmentation] Refined window {r.get('start_frame')}-{r.get('end_frame')} is short ({refined_dur}f) and low quality (conf={r.get('confidence')}, r2={r.get('parabola_r2')}, pts={r.get('detected_points')}). Falling back to coarse window {cs}-{ce}.")
+                all_refined.append({
+                    "start_frame": cs,
+                    "end_frame": ce,
+                    "flight_start_frame": r.get("flight_start_frame", cs),
+                    "flight_end_frame": r.get("flight_end_frame", ce),
+                    "detected_points": r.get("detected_points", 0),
+                    "parabola_r2": r.get("parabola_r2", 0.0),
+                    "confidence": r.get("confidence", 0.50)
+                })
+            else:
+                all_refined.append(r)
 
     cap.release()
 
