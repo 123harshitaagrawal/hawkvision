@@ -8,81 +8,6 @@ import numpy as np
 from ultralytics import YOLO
 from speed_tracker import CricketSpeedTracker
 
-# Offline Haar Cascade face detection initialization
-_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-_HAAR_PATH = os.path.join(_BASE_DIR, "haarcascade_frontalface_default.xml")
-_FACE_CASCADE = None
-if os.path.exists(_HAAR_PATH):
-    try:
-        _FACE_CASCADE = cv2.CascadeClassifier(_HAAR_PATH)
-        if _FACE_CASCADE.empty():
-            _FACE_CASCADE = None
-    except Exception:
-        _FACE_CASCADE = None
-
-def detect_faces_fast(frame, target_w=160, target_h=90):
-    """
-    Run fast multi-scale face detection on downscaled grayscale frame.
-    Returns list of (fx, fy, fw, fh) scaled to original frame dimensions.
-    """
-    if _FACE_CASCADE is None or frame is None:
-        return []
-    try:
-        h, w = frame.shape[:2]
-        small_gray = cv2.cvtColor(cv2.resize(frame, (target_w, target_h)), cv2.COLOR_BGR2GRAY)
-        scale_x = w / float(target_w)
-        scale_y = h / float(target_h)
-        faces = _FACE_CASCADE.detectMultiScale(small_gray, scaleFactor=1.18, minNeighbors=3, minSize=(14, 14))
-        return [(int(fx * scale_x), int(fy * scale_y), int(fw * scale_x), int(fh * scale_y)) for (fx, fy, fw, fh) in faces]
-    except Exception:
-        return []
-
-def get_distance_to_box(cx, cy, box):
-    """
-    Euclidean distance from point (cx, cy) to edge of box [x1, y1, x2, y2].
-    Returns 0.0 if (cx, cy) is inside the box.
-    Returns float('inf') if box is None.
-    """
-    if box is None:
-        return float('inf')
-    x1, y1, x2, y2 = box
-    dx = max(x1 - cx, 0.0, cx - x2)
-    dy = max(y1 - cy, 0.0, cy - y2)
-    return math.hypot(dx, dy)
-
-def get_distance_to_nearest_person(cx, cy, person_boxes):
-    """Euclidean distance from (cx, cy) to edge of nearest person box."""
-    if not person_boxes:
-        return float('inf')
-    return min(get_distance_to_box(cx, cy, b) for b in person_boxes)
-
-def identify_bowler_and_batsman(person_boxes, bowler_release_zone, width, height):
-    """
-    Classify detected persons into (bowler_box, batsman_box) based on release zone.
-    Bowler is the person nearest to the release zone.
-    Batsman is the person furthest down-pitch from release zone.
-    """
-    if not person_boxes:
-        return None, None
-    if len(person_boxes) == 1:
-        return person_boxes[0], None
-    
-    if bowler_release_zone is not None:
-        rx, ry = bowler_release_zone
-        closest_idx = -1
-        min_dist = float('inf')
-        for idx, box in enumerate(person_boxes):
-            d = get_distance_to_box(rx, ry, box)
-            if d < min_dist:
-                min_dist = d
-                closest_idx = idx
-        bowler_box = person_boxes[closest_idx]
-        other_boxes = [b for i, b in enumerate(person_boxes) if i != closest_idx]
-        batsman_box = max(other_boxes, key=lambda b: get_distance_to_box(rx, ry, b)) if other_boxes else None
-        return bowler_box, batsman_box
-    else:
-        return person_boxes[0], (person_boxes[1] if len(person_boxes) > 1 else None)
-
 def angle_between_lines(m1, m2=1):
     """Calculate the angle between two lines."""
     if m1 != -1 / m2:
@@ -266,67 +191,6 @@ def fit_parabola_r2(frames, ys):
         return 0.0
 
 
-def is_delivery_candidate_cluster(cluster, width, height, fps):
-    """
-    Evaluates whether a candidate detection cluster matches genuine cricket ball kinematics:
-    1. Total displacement span >= max(40px, 0.12 * max(width, height))
-    2. Bounding box size ceiling: mean_bw <= 0.10*w, mean_bh <= 0.12*h (rejects face/body)
-    3. Directional monotonicity: <= 35% direction reversals (rejects oscillating head/hands)
-    4. Minimum implied speed floor: peak segment speed >= 15.0 km/h
-    Returns (is_valid: bool, reason: str).
-    """
-    if len(cluster) < 3:
-        return False, "Cluster has fewer than 3 detections"
-
-    x_list = [d['cx'] for d in cluster]
-    y_list = [d['cy'] for d in cluster]
-
-    span_x = max(x_list) - min(x_list)
-    span_y = max(y_list) - min(y_list)
-    total_span = max(span_x, span_y)
-
-    # Gate 1: Total displacement span across delivery
-    min_span_allowed = max(40.0, 0.12 * max(width, height))
-    if total_span < min_span_allowed:
-        return False, f"Total displacement span {total_span:.1f}px < {min_span_allowed:.1f}px (head/hand nod, not delivery)"
-
-    # Gate 2: Bounding box size ceiling relative to frame
-    mean_bw = sum(d['box'][2] - d['box'][0] for d in cluster) / len(cluster)
-    mean_bh = sum(d['box'][3] - d['box'][1] for d in cluster) / len(cluster)
-    if mean_bw > width * 0.10 or mean_bh > height * 0.12:
-        return False, f"Mean bbox size {mean_bw:.1f}x{mean_bh:.1f} exceeds ball ceiling (face/body/bat)"
-
-    # Gate 3: Directional monotonicity along dominant axis
-    dominant_coords = y_list if span_y >= span_x else x_list
-    reversals = 0
-    steps = 0
-    for k in range(len(dominant_coords) - 2):
-        d1 = dominant_coords[k + 1] - dominant_coords[k]
-        d2 = dominant_coords[k + 2] - dominant_coords[k + 1]
-        if abs(d1) > 2.0 and abs(d2) > 2.0:
-            steps += 1
-            if (d1 * d2) < 0:
-                reversals += 1
-    if steps >= 3 and (reversals / steps) > 0.35:
-        return False, f"Reversal rate {reversals}/{steps} ({reversals/steps*100:.0f}%) exceeds 35% (oscillating motion)"
-
-    # Gate 4: Minimum implied speed floor
-    m_per_px_est = 18.2 / max(height * 0.55, 60.0)
-    max_seg_speed_kmh = 0.0
-    for k in range(len(cluster) - 1):
-        df = max(cluster[k + 1]['frame'] - cluster[k]['frame'], 1)
-        d_dist = math.hypot(cluster[k + 1]['cx'] - cluster[k]['cx'], cluster[k + 1]['cy'] - cluster[k]['cy'])
-        dt_sec = df / max(fps, 1.0)
-        if dt_sec > 0:
-            seg_spd = (d_dist * m_per_px_est / dt_sec) * 3.6
-            if seg_spd > max_seg_speed_kmh:
-                max_seg_speed_kmh = seg_spd
-    if max_seg_speed_kmh < 15.0:
-        return False, f"Peak implied speed {max_seg_speed_kmh:.1f} km/h < min 15.0 km/h"
-
-    return True, "Valid delivery candidate cluster"
-
-
 def pass_b_refine_window(cap, model, c_start, c_end, fps, conf_thresh=0.15):
     """
     Pass B: Precise release & impact boundary refinement using YOLO ball tracking and projectile kinematics.
@@ -353,7 +217,7 @@ def pass_b_refine_window(cap, model, c_start, c_end, fps, conf_thresh=0.15):
             raw_detections.append(best)
 
     if len(raw_detections) < 3:
-        return [], False
+        return []
 
     # Filter stationary noise
     moving_detections = []
@@ -371,13 +235,13 @@ def pass_b_refine_window(cap, model, c_start, c_end, fps, conf_thresh=0.15):
             moving_detections.append(det)
 
     if len(moving_detections) < 3:
-        return [], False
+        return []
 
     # Group into delivery clusters: cricket ball flight is 0.4s-1.0s.
-    # Adaptive gap threshold scaling with actual fps to avoid truncating indoor nets footage
+    # Split deliveries if detection gap > 0.75s (~22 frames at 30 fps), preventing multi-delivery merge
     delivery_clusters = []
     cur_cluster = [moving_detections[0]]
-    cluster_gap_thresh = max(16, int(fps * 0.90))
+    cluster_gap_thresh = max(12, int(fps * 0.75))
     for d in moving_detections[1:]:
         if d['frame'] - cur_cluster[-1]['frame'] <= cluster_gap_thresh:
             cur_cluster.append(d)
@@ -389,32 +253,23 @@ def pass_b_refine_window(cap, model, c_start, c_end, fps, conf_thresh=0.15):
         delivery_clusters.append(cur_cluster)
 
     if not delivery_clusters:
-        return [], False
-
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 640)
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 360)
+        return []
 
     refined = []
-    rejected_count = 0
-
-    for cluster_idx, cluster in enumerate(delivery_clusters, 1):
+    for cluster in delivery_clusters:
         f_list = [d['frame'] for d in cluster]
         y_list = [d['cy'] for d in cluster]
         conf_list = [d['conf'] for d in cluster]
 
-        is_valid, reason = is_delivery_candidate_cluster(cluster, width, height, fps)
-        if not is_valid:
-            print(f"[Gating] Cluster {cluster_idx} rejected: {reason}")
-            rejected_count += 1
-            continue
-
         r2 = fit_parabola_r2(f_list, y_list)
 
         # Release frame: ball leaving bowler's hand
+        # Safety buffer: 4 frames before first detected airborne flight
         first_f = f_list[0]
         release_f = max(c_start, first_f - 4)
 
         # Impact / end frame: ground pitch contact or stumps hit
+        # Safety buffer: 3 frames after last detected ball flight (tightened against next run-up)
         last_f = f_list[-1]
         impact_f = min(c_end, last_f + 3)
 
@@ -437,28 +292,7 @@ def pass_b_refine_window(cap, model, c_start, c_end, fps, conf_thresh=0.15):
             "confidence": seg_conf
         })
 
-    had_rejected = (rejected_count > 0 and len(refined) == 0)
-    return refined, had_rejected
-
-
-def should_fallback_to_coarse_window(r, coarse_start, coarse_end, fps):
-    """
-    Evaluates whether a refined delivery window should fall back to its parent Pass A coarse window.
-    Only falls back when the refined result is both short AND low-quality (e.g. indoor nets with sporadic tracking).
-    If the refined delivery has high confidence, good parabola fit, and sufficient detected points,
-    the tight window is trusted as-is (e.g. talk-shot-talk clip trimming out talking before/after).
-    """
-    coarse_duration = max(1, coarse_end - coarse_start)
-    refined_duration = max(1, r.get('end_frame', coarse_end) - r.get('start_frame', coarse_start))
-
-    is_low_quality = (
-        r.get("confidence", 1.0) < 0.55
-        or r.get("parabola_r2", 1.0) < 0.35
-        or r.get("detected_points", 999) < 5
-    )
-
-    is_short = (refined_duration < 0.35 * coarse_duration and refined_duration < fps * 1.2)
-    return is_short and is_low_quality
+    return refined
 
 
 def segment_deliveries(video_path, model=None, conf_thresh=0.15, task_id='session', debug=False, progress_callback=None):
@@ -489,7 +323,6 @@ def segment_deliveries(video_path, model=None, conf_thresh=0.15, task_id='sessio
     coarse = pass_a_coarse_windows(video_path, progress_callback=progress_callback)
 
     all_refined = []
-    any_rejected = False
     total_coarse = len(coarse)
     for idx, (cs, ce) in enumerate(coarse, 1):
         if progress_callback:
@@ -498,38 +331,14 @@ def segment_deliveries(video_path, model=None, conf_thresh=0.15, task_id='sessio
                                   f"Pass B: Refining release/impact boundaries for shot {idx} of {total_coarse}...")
             except Exception:
                 pass
-        out = pass_b_refine_window(cap, model, cs, ce, fps, conf_thresh=conf_thresh)
-        if isinstance(out, (list, tuple)) and len(out) == 2:
-            res, had_rejected = out
-        elif isinstance(out, (list, tuple)) and len(out) == 1:
-            res, had_rejected = out[0], False
-        else:
-            res, had_rejected = out, False
-
-        if had_rejected:
-            any_rejected = True
-
-        for r in (res or []):
-            if should_fallback_to_coarse_window(r, cs, ce, fps):
-                refined_dur = r.get('end_frame', ce) - r.get('start_frame', cs)
-                print(f"[Segmentation] Refined window {r.get('start_frame')}-{r.get('end_frame')} is short ({refined_dur}f) and low quality (conf={r.get('confidence')}, r2={r.get('parabola_r2')}, pts={r.get('detected_points')}). Falling back to coarse window {cs}-{ce}.")
-                all_refined.append({
-                    "start_frame": cs,
-                    "end_frame": ce,
-                    "flight_start_frame": r.get("flight_start_frame", cs),
-                    "flight_end_frame": r.get("flight_end_frame", ce),
-                    "detected_points": r.get("detected_points", 0),
-                    "parabola_r2": r.get("parabola_r2", 0.0),
-                    "confidence": r.get("confidence", 0.50)
-                })
-            else:
-                all_refined.append(r)
+        res = pass_b_refine_window(cap, model, cs, ce, fps, conf_thresh=conf_thresh)
+        for r in res:
+            all_refined.append(r)
 
     cap.release()
 
-    # Fallback to Pass A coarse windows ONLY if Pass B did NOT actively reject non-cricket movement
-    # (e.g. sparse detections from motion blur), but NOT when motion was identified as non-delivery/face movement.
-    if not all_refined and coarse and not any_rejected:
+    # Fallback to Pass A coarse windows if Pass B returned no refined windows
+    if not all_refined and coarse:
         for cs, ce in coarse:
             all_refined.append({
                 "start_frame": cs,
@@ -540,8 +349,6 @@ def segment_deliveries(video_path, model=None, conf_thresh=0.15, task_id='sessio
                 "parabola_r2": 0.0,
                 "confidence": 0.50
             })
-    elif not all_refined and any_rejected:
-        print("[Segmentation] All candidate windows rejected by Pass B projectile gates (talking face / non-delivery). Zero shots produced.")
 
     # Midpoint split for overlapping refined windows
     for i in range(len(all_refined) - 1):
@@ -782,37 +589,6 @@ class CricketTrajectoryPredictor:
         self.conf_thresh = conf_thresh
         self.history_len = history_len
         self.pred_steps = pred_steps
-
-        # Person detector for body-attachment gating
-        person_model_paths = [
-            'yolov8n.pt',
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'yolov8n.pt'),
-            os.path.join('Cricket-Ball-Trajectory-Prediction-master', 'yolov8n.pt'),
-            'yolov8s.pt'
-        ]
-        person_model_path = None
-        for p in person_model_paths:
-            if os.path.exists(p):
-                person_model_path = p
-                break
-        if person_model_path is None:
-            person_model_path = 'yolov8n.pt'
-        self.person_model_path = person_model_path
-        self._person_model = None
-
-    @property
-    def person_model(self):
-        if self._person_model is None:
-            try:
-                self._person_model = YOLO(self.person_model_path)
-                if self.device is not None:
-                    try:
-                        self._person_model.to(self.device)
-                    except Exception:
-                        pass
-            except Exception:
-                self._person_model = None
-        return self._person_model
 
     def draw_glowing_path(self, frame, points, color_bgr=(0, 230, 255), core_color=(255, 255, 255), 
                           use_bezier=True, show_nodes=True):
@@ -1068,14 +844,6 @@ class CricketTrajectoryPredictor:
             tracking_stopped_for_shot = False
             consecutive_slow_frames = 0
             bowler_release_zone = None
-            frame_buffer = deque()
-            pending_bounce = None
-            cached_faces = []
-            cached_persons = []
-            bowler_box = None
-            batsman_box = None
-            recent_bowler_separations = deque(maxlen=15)
-            has_separated_from_bowler = False
 
             # Seek video directly to the start of this delivery window
             shot_video_start_frame = processed_frames
@@ -1091,29 +859,6 @@ class CricketTrajectoryPredictor:
                 t_now = time.time()
                 instant_fps = 1.0 / max(t_now - prev_time, 1e-5)
                 prev_time = t_now
-
-                # Update face mask periodically during discovery
-                if (frame_idx % 4 == 0 or kalman is None) and _FACE_CASCADE is not None:
-                    cached_faces = detect_faces_fast(frame)
-
-                # Update person detector on 3-frame stride (low-cost, ~16ms/frame on CPU, <1ms GPU)
-                if (frame_idx % 3 == 0 or not cached_persons) and self.person_model is not None:
-                    try:
-                        p_res = self.person_model.predict(frame, classes=[0], conf=0.25, imgsz=320, verbose=False)
-                        if len(p_res) > 0 and p_res[0].boxes is not None and len(p_res[0].boxes) > 0:
-                            cached_persons = [list(map(float, b)) for b in p_res[0].boxes.xyxy.cpu().numpy()]
-                        else:
-                            cached_persons = []
-                    except Exception:
-                        pass
-
-                # Update bowler & batsman classification
-                if cached_persons:
-                    b_cand, bat_cand = identify_bowler_and_batsman(cached_persons, bowler_release_zone, width, height)
-                    if b_cand is not None:
-                        bowler_box = b_cand
-                    if bat_cand is not None:
-                        batsman_box = bat_cand
 
                 # 1. Predict with Kalman filter if active
                 predicted_pos = None
@@ -1148,50 +893,6 @@ class CricketTrajectoryPredictor:
                         cx = (x1 + x2) / 2.0
                         cy = (y1 + y2) / 2.0
 
-                        # --- Body-Attachment & Role Gating ---
-                        dist_to_bowler = get_distance_to_box(cx, cy, bowler_box) if bowler_box is not None else float('inf')
-                        dist_to_nearest_person = get_distance_to_nearest_person(cx, cy, cached_persons)
-
-                        # Body adjacency logic:
-                        # If bowler_box is known, test distance to bowler.
-                        # If bowler_box is None (safe fallback), test distance to nearest person if track hasn't separated.
-                        is_near_bowler = (dist_to_bowler < width * 0.12)
-                        if bowler_box is None and cached_persons:
-                            if not has_separated_from_bowler:
-                                is_near_bowler = (dist_to_nearest_person < width * 0.12)
-                        elif bowler_box is None and not cached_persons and bowler_release_zone is not None:
-                            if not has_separated_from_bowler:
-                                dist_from_release = math.hypot(cx - bowler_release_zone[0], cy - bowler_release_zone[1])
-                                is_near_bowler = (dist_from_release < width * 0.12)
-
-                        # --- Gate 1A: Absolute Bounding Box Size Ceiling ---
-                        # Body-adjacent candidates near bowler get strict ceiling to block wristbands / hands.
-                        # Free-flying candidates get relaxed ceiling to comfortably admit close nets ball.
-                        if is_near_bowler:
-                            max_w_allowed = width * 0.06
-                            max_h_allowed = height * 0.07
-                            max_area_allowed = width * height * 0.0045
-                        else:
-                            max_w_allowed = width * 0.11
-                            max_h_allowed = height * 0.13
-                            max_area_allowed = width * height * 0.013
-
-                        if bw > max_w_allowed or bh > max_h_allowed or (bw * bh) > max_area_allowed:
-                            continue
-
-                        # --- Gate 1B: Face Exclusion Mask ---
-                        # Reject candidates whose centers fall directly inside a detected human face
-                        is_face_hit = False
-                        if cached_faces:
-                            for (fx, fy, fw, fh) in cached_faces:
-                                if (fx + 0.10 * fw <= cx <= fx + 0.90 * fw) and (fy + 0.10 * fh <= cy <= fy + 0.90 * fh):
-                                    curr_v = math.hypot(*kalman.get_velocity()) if kalman is not None else 0.0
-                                    if kalman is None or curr_v < 12.0:
-                                        is_face_hit = True
-                                        break
-                        if is_face_hit:
-                            continue
-
                         # --- Continuity & Outlier Rejection (Bug A Fix) ---
                         # Once track has >= 6 points and moved down the pitch:
                         if len(full_trajectory) >= 6:
@@ -1216,22 +917,14 @@ class CricketTrajectoryPredictor:
 
                             # Check if candidate matches a reflected bounce trajectory
                             effective_dist = dist
-                            if current_phase == 1 and len(full_trajectory) >= 3:
+                            if current_phase == 1 and len(full_trajectory) >= 3 and pred_y > height * 0.30:
                                 vy_est = kalman.x[3]
                                 if vy_est > 0.8:
-                                    # REBOUND PERMISSION RULES:
-                                    # 1. Pitch bounce CANNOT occur on or adjacent to the bowler's body.
-                                    #    Track must have separated from bowler (has_separated_from_bowler),
-                                    #    and candidate cannot be near bowler (not is_near_bowler).
-                                    # 2. Near batsman, rebound is permitted based on parabolic reflection.
-                                    rebound_permitted = (not is_near_bowler) and (has_separated_from_bowler or bowler_box is None)
-
-                                    if rebound_permitted:
-                                        bounce_y_pred = pred_y - 1.55 * vy_est * kalman.dt
-                                        dist_reflected = math.hypot(cx - pred_x, cy - bounce_y_pred)
-                                        if dist_reflected < dist and dist_reflected < KALMAN_GATE_RADIUS * 1.8 and cy <= pred_y + 8:
-                                            effective_dist = dist_reflected
-                                            is_rebound_cand = True
+                                    bounce_y_pred = pred_y - 1.55 * vy_est * kalman.dt
+                                    dist_reflected = math.hypot(cx - pred_x, cy - bounce_y_pred)
+                                    if dist_reflected < dist and dist_reflected < KALMAN_GATE_RADIUS * 1.8 and cy <= pred_y + 8:
+                                        effective_dist = dist_reflected
+                                        is_rebound_cand = True
 
                             base_gate = KALMAN_GATE_RADIUS * 2.2 if post_bounce_boost_frames > 0 else KALMAN_GATE_RADIUS
                             strict_gate = KALMAN_GATE_RADIUS * 1.5 if post_bounce_boost_frames > 0 else KALMAN_STRICT_RADIUS
@@ -1241,9 +934,6 @@ class CricketTrajectoryPredictor:
                                 continue
 
                             min_conf = 0.18 if (post_bounce_boost_frames > 0 or is_rebound_cand) else MIN_CONF_TRACKING
-                            if is_near_bowler:
-                                min_conf = max(min_conf, 0.45)
-
                             if conf < min_conf:
                                 continue
 
@@ -1251,8 +941,6 @@ class CricketTrajectoryPredictor:
                             score = (conf * 0.45) + (proximity_weight * 0.45) + (circularity * 0.10)
                         else:
                             disc_conf = 0.25 if post_bounce_boost_frames > 0 else MIN_CONF_DISCOVERY
-                            if is_near_bowler:
-                                disc_conf = max(disc_conf, 0.55)
                             if conf < disc_conf:
                                 continue
                             score = (conf * 0.75) + (circularity * 0.25)
@@ -1279,18 +967,18 @@ class CricketTrajectoryPredictor:
                         post_bounce_boost_frames = 8
                         if bounce_point is None and len(full_trajectory) > 0:
                             bounce_point = full_trajectory[-1]
-                            pending_bounce = {
+                            b_info = {
                                 "shot": shot_idx + 1,
                                 "frame": frame_idx,
                                 "timestamp": round(frame_idx / fps, 2),
                                 "angle": round(last_angle, 1),
                                 "speed_kmh": current_speed_kmh,
                                 "speed_mph": current_speed_mph,
-                                "position": list(bounce_point),
-                                "observed_phase2_frames": 0,
-                                "phase2_displacements": [],
-                                "confirmed": False
+                                "position": list(bounce_point)
                             }
+                            bounce_events.append(b_info)
+                            telemetry["bounce_events"].append(b_info)
+                            speed_tracker.record_bounce(frame_idx)
 
                     if kalman is not None:
                         kx, ky = kalman.update(cx, cy)
@@ -1312,18 +1000,6 @@ class CricketTrajectoryPredictor:
                             if bowler_release_zone is None:
                                 bowler_release_zone = current_centroid
 
-                            # Track bowler separation
-                            if bowler_box is not None:
-                                sep = get_distance_to_box(cx, cy, bowler_box)
-                                recent_bowler_separations.append(sep)
-                                if sep >= width * 0.15:
-                                    has_separated_from_bowler = True
-                            elif bowler_release_zone is not None:
-                                sep = math.hypot(cx - bowler_release_zone[0], cy - bowler_release_zone[1])
-                                recent_bowler_separations.append(sep)
-                                if sep >= width * 0.15:
-                                    has_separated_from_bowler = True
-
                     else:
                         if pending_candidate is not None:
                             px, py, pc = pending_candidate
@@ -1341,18 +1017,6 @@ class CricketTrajectoryPredictor:
                                 shot_detected_frames += 1
                                 if bowler_release_zone is None:
                                     bowler_release_zone = current_centroid
-
-                                # Track bowler separation
-                                if bowler_box is not None:
-                                    sep = get_distance_to_box(cx, cy, bowler_box)
-                                    recent_bowler_separations.append(sep)
-                                    if sep >= width * 0.15:
-                                        has_separated_from_bowler = True
-                                elif bowler_release_zone is not None:
-                                    sep = math.hypot(cx - bowler_release_zone[0], cy - bowler_release_zone[1])
-                                    recent_bowler_separations.append(sep)
-                                    if sep >= width * 0.15:
-                                        has_separated_from_bowler = True
                             else:
                                 pending_candidate = (cx, cy, conf)
                                 pending_candidate_count = 1
@@ -1363,11 +1027,32 @@ class CricketTrajectoryPredictor:
                 else:
                     pending_candidate = None
                     pending_candidate_count = 0
+
                 # Kalman momentum bridge for missed frames
                 if not ball_detected and not is_estimated and not tracking_stopped_for_shot:
                     if kalman is not None and missed_frames < max_missed_frames:
                         missed_frames += 1
                         is_estimated = True
+                        # If in Phase 1 and missed right around the bounce area:
+                        if current_phase == 1 and len(full_trajectory) >= 3 and kalman.x[1] > height * 0.40 and kalman.x[3] > 0:
+                            kalman.reflect_bounce(restitution=0.55)
+                            current_phase = 2
+                            post_bounce_boost_frames = 8
+                            if bounce_point is None and len(full_trajectory) > 0:
+                                bounce_point = full_trajectory[-1]
+                                b_info = {
+                                    "shot": shot_idx + 1,
+                                    "frame": frame_idx,
+                                    "timestamp": round(frame_idx / fps, 2),
+                                    "angle": round(last_angle, 1),
+                                    "speed_kmh": current_speed_kmh,
+                                    "speed_mph": current_speed_mph,
+                                    "position": list(bounce_point)
+                                }
+                                bounce_events.append(b_info)
+                                telemetry["bounce_events"].append(b_info)
+                                speed_tracker.record_bounce(frame_idx)
+
                         kx, ky = kalman.get_pos()
                         if 0 <= kx < width and 0 <= ky < height:
                             current_centroid = (kx, ky)
@@ -1399,56 +1084,6 @@ class CricketTrajectoryPredictor:
                         if bounce_point and (len(phase_2_points) == 0 or phase_2_points[0] != bounce_point):
                             phase_2_points.insert(0, bounce_point)
                         phase_2_points.append(current_centroid)
-
-                    # Delayed Bounce Confirmation: evaluate subsequent Phase 2 motion
-                    if pending_bounce is not None and not pending_bounce["confirmed"]:
-                        if len(full_trajectory) >= 2:
-                            d_p2 = math.hypot(full_trajectory[-1][0] - full_trajectory[-2][0], full_trajectory[-1][1] - full_trajectory[-2][1])
-                            pending_bounce["phase2_displacements"].append(d_p2)
-                            pending_bounce["observed_phase2_frames"] += 1
-
-                            if pending_bounce["observed_phase2_frames"] >= 4:
-                                p2_disps = pending_bounce["phase2_displacements"]
-                                avg_p2_disp = sum(p2_disps) / len(p2_disps)
-                                min_p2_disp = min(p2_disps)
-
-                                # Require active ongoing flight rather than dead stop in netting/wall
-                                if avg_p2_disp >= 2.0 and min_p2_disp >= 0.8:
-                                    pending_bounce["confirmed"] = True
-                                    b_info = {
-                                        "shot": pending_bounce["shot"],
-                                        "frame": pending_bounce["frame"],
-                                        "timestamp": pending_bounce["timestamp"],
-                                        "angle": pending_bounce["angle"],
-                                        "speed_kmh": pending_bounce["speed_kmh"],
-                                        "speed_mph": pending_bounce["speed_mph"],
-                                        "position": pending_bounce["position"]
-                                    }
-                                    bounce_events.append(b_info)
-                                    telemetry["bounce_events"].append(b_info)
-                                    speed_tracker.record_bounce(pending_bounce["frame"])
-
-                                    # Retroactively annotate buffered frames that occurred at or after bounce moment
-                                    bx, by = pending_bounce["position"]
-                                    b_angle = pending_bounce["angle"]
-                                    for buf_item in frame_buffer:
-                                        if buf_item["frame_idx"] >= pending_bounce["frame"]:
-                                            bf = buf_item["frame"]
-                                            cv2.circle(bf, (bx, by), radius=14, color=(0, 140, 255), thickness=2, lineType=cv2.LINE_AA)
-                                            cv2.circle(bf, (bx, by), radius=7, color=(0, 230, 255), thickness=-1, lineType=cv2.LINE_AA)
-                                            cv2.circle(bf, (bx, by), radius=2, color=(255, 255, 255), thickness=-1, lineType=cv2.LINE_AA)
-                                            cv2.putText(bf, f"PITCH {b_angle:.0f}°", (bx + 12, by + 4),
-                                                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 230, 255), 1, cv2.LINE_AA)
-                                            if buf_item["frame_idx"] == pending_bounce["frame"]:
-                                                cv2.rectangle(bf, (width - 240, 15), (width - 15, 55), (0, 80, 255), -1)
-                                                cv2.putText(bf, "! PITCH BOUNCE !", (width - 225, 42),
-                                                            cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 2, cv2.LINE_AA)
-                                    print(f"[Physics] Frame {pending_bounce['frame']}: Pitch bounce confirmed ({b_angle:.1f}°).")
-                                    pending_bounce = None
-                                else:
-                                    print(f"[Physics] Frame {pending_bounce['frame']}: Candidate bounce rejected (trajectory halted abruptly in netting/wall, avg disp={avg_p2_disp:.1f}px).")
-                                    pending_bounce = None
-                                    bounce_point = None
 
                     # Phase 2 termination check (ground stop or stumps hit)
                     if current_phase == 2 and len(phase_2_points) >= 3:
@@ -1493,6 +1128,7 @@ class CricketTrajectoryPredictor:
                         if is_rebound and current_phase == 1:
                             consecutive_bounces += 1
                             if consecutive_bounces == 1:
+                                is_bounce = True
                                 current_phase = 2
                                 post_bounce_boost_frames = 8
                                 if kalman is not None and kalman.x[3] > 0:
@@ -1504,18 +1140,18 @@ class CricketTrajectoryPredictor:
                                         phase_1_points.append(bounce_point)
                                     if not phase_2_points:
                                         phase_2_points.append(bounce_point)
-                                pending_bounce = {
+                                speed_tracker.record_bounce(frame_idx)
+                                b_info = {
                                     "shot": shot_idx + 1,
                                     "frame": frame_idx,
                                     "timestamp": round(frame_idx / fps, 2),
                                     "angle": round(last_angle, 1),
                                     "speed_kmh": current_speed_kmh,
                                     "speed_mph": current_speed_mph,
-                                    "position": list(bounce_point) if bounce_point else [pts[-1][0], pts[-1][1]],
-                                    "observed_phase2_frames": 0,
-                                    "phase2_displacements": [],
-                                    "confirmed": False
+                                    "position": list(bounce_point) if bounce_point else [pts[-1][0], pts[-1][1]]
                                 }
+                                bounce_events.append(b_info)
+                                telemetry["bounce_events"].append(b_info)
                         else:
                             consecutive_bounces = 0
 
@@ -1594,14 +1230,12 @@ class CricketTrajectoryPredictor:
                     angle_str = f"ANGLE: {last_angle:.1f}°"
                 cv2.putText(frame, angle_str, (22, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 220, 255), 2, cv2.LINE_AA)
 
-                # Flash pitch bounce banner ONLY on confirmed bounce frame
-                is_bounce_confirmed = any(b.get("frame") == frame_idx for b in bounce_events)
-                if is_bounce_confirmed:
+                if is_bounce or consecutive_bounces > 0:
                     cv2.rectangle(frame, (width - 240, 15), (width - 15, 55), (0, 80, 255), -1)
                     cv2.putText(frame, "! PITCH BOUNCE !", (width - 225, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 2, cv2.LINE_AA)
 
                 # Capture candidate thumbnail frame
-                if is_bounce_confirmed or best_thumb_frame is None or (ball_detected and display_conf > 0.65):
+                if is_bounce or best_thumb_frame is None or (ball_detected and display_conf > 0.65):
                     best_thumb_frame = frame.copy()
 
                 frame_entry = {
@@ -1616,7 +1250,7 @@ class CricketTrajectoryPredictor:
                     "speed_kmh": current_speed_kmh,
                     "speed_mph": current_speed_mph,
                     "angle": round(last_angle, 2),
-                    "is_bounce": is_bounce_confirmed,
+                    "is_bounce": is_bounce,
                     "is_stump_hit": is_stump_hit,
                     "predicted_points": future_positions
                 }
@@ -1630,18 +1264,15 @@ class CricketTrajectoryPredictor:
                         "x": current_centroid[0],
                         "y": current_centroid[1],
                         "is_estimated": is_estimated,
-                        "is_bounce": is_bounce_confirmed,
+                        "is_bounce": is_bounce,
                         "is_stump_hit": is_stump_hit
                     })
 
-                # Buffer frame for delayed confirmation before writing to disk
-                frame_buffer.append({"frame": frame, "frame_idx": frame_idx})
-                if len(frame_buffer) > 6:
-                    item_to_write = frame_buffer.popleft()
-                    if out is not None:
-                        out.write(item_to_write["frame"])
-                    if shot_writer is not None:
-                        shot_writer.write(item_to_write["frame"])
+                # Write to full combined video and individual shot video
+                if out is not None:
+                    out.write(frame)
+                if shot_writer is not None:
+                    shot_writer.write(frame)
 
                 # Live preview window if requested
                 if show_window:
@@ -1669,14 +1300,6 @@ class CricketTrajectoryPredictor:
                             progress_callback(processed_frames, effective_total_frames, last_angle, ball_detected or is_estimated)
                         except Exception:
                             pass
-
-            # Flush any remaining buffered frames to disk
-            while frame_buffer:
-                item_to_write = frame_buffer.popleft()
-                if out is not None:
-                    out.write(item_to_write["frame"])
-                if shot_writer is not None:
-                    shot_writer.write(item_to_write["frame"])
 
             shot_video_end_frame = processed_frames
             shot_video_start_sec = round(shot_video_start_frame / fps, 2)

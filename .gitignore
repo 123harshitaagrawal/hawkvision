@@ -31,8 +31,6 @@ videos/test.mp4
 videos/scratch_*/
 videos/output_predicted/
 !videos/test1.mp4
-!videos/upload_3617b081_test2.mp4
-!videos/upload_c57d9b0d_shots.mp4
 
 # Temporary / Scratch directories
 scratch/

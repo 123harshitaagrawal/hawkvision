@@ -30,24 +30,6 @@ HISTORY_INDEX_PATH = os.path.join(PROCESSED_DIR, 'history.json')
 # In-memory task tracker
 tasks = {}
 
-# Minimum validity floor constants for bowling deliveries
-MIN_VALID_RELEASE_KMH = 20.0
-MIN_TRACKING_RATE_PCT = 15.0
-MIN_DETECTED_FRAMES = 4
-
-def is_valid_delivery_shot(s):
-    """Determine if a segmented shot meets minimum physical validity criteria for a cricket delivery."""
-    if not s or not isinstance(s, dict):
-        return False
-    rel = float(s.get("release_speed_kmh", 0) or 0)
-    avg_s = float(s.get("avg_speed_kmh", 0) or 0)
-    max_s = float(s.get("max_speed_kmh", 0) or 0)
-    det_f = int(s.get("detected_frames", 0) or 0)
-    rate = float(s.get("tracking_rate", 0) or 0)
-    eff_speed = max(rel, avg_s, max_s)
-    # Must achieve at least 20 km/h and have at least minimal verified tracked frames
-    return eff_speed >= MIN_VALID_RELEASE_KMH and (rate >= MIN_TRACKING_RATE_PCT or det_f >= MIN_DETECTED_FRAMES)
-
 # ─────────────────────────────────────────────
 #  HISTORY MANAGER
 # ─────────────────────────────────────────────
@@ -259,10 +241,8 @@ def _record_to_index(task_id, task_data):
             "bounce_count": s.get("bounce_count"),
             "thumbnail_url": s.get("thumbnail_url"),
             "video_url": s.get("video_url"),
-            "is_best": s.get("is_best", False),
-            "is_valid_delivery": s.get("is_valid_delivery", False)
+            "is_best": s.get("is_best", False)
         })
-    valid_cnt = sum(1 for s in shots if is_valid_delivery_shot(s))
     return {
         'task_id': task_id,
         'timestamp': task_data.get('timestamp', datetime.datetime.now().isoformat()),
@@ -279,9 +259,6 @@ def _record_to_index(task_id, task_data):
         'bounce_count': len(tel.get('bounce_events', [])),
         'total_shots': tot_shots,
         'shot_count': tot_shots,
-        'valid_shot_count': valid_cnt,
-        'has_valid_delivery': task_data.get('has_valid_delivery', valid_cnt > 0),
-        'best_shot': task_data.get('best_shot'),
         'shots': shots_summary,
         'has_insights': bool(task_data.get('insights')),
     }
@@ -465,35 +442,26 @@ def start_prediction():
             )
 
             shots_data = extract_or_build_shots_data(telemetry)
-            valid_shots = [s for s in shots_data if is_valid_delivery_shot(s)]
-            best_shot_idx = None
-            has_valid_delivery = False
-
-            if valid_shots:
+            best_shot_idx = 1
+            if shots_data:
                 best_item = max(
-                    valid_shots,
-                    key=lambda s: (float(s.get("release_speed_kmh", 0) or 0) + float(s.get("max_speed_kmh", 0) or 0))
+                    shots_data,
+                    key=lambda s: (float(s.get("release_speed_kmh", 0) or 0) + float(s.get("max_speed_kmh", 0) or 0)),
+                    default=shots_data[0]
                 )
                 best_shot_idx = best_item.get("shot", 1)
-                has_valid_delivery = True
-
-            for s in shots_data:
-                s["is_best"] = (best_shot_idx is not None and s.get("shot") == best_shot_idx)
-                s["is_valid_delivery"] = is_valid_delivery_shot(s)
+                for s in shots_data:
+                    s["is_best"] = (s.get("shot") == best_shot_idx)
 
             telemetry["shots_data"] = shots_data
             telemetry["shots"] = shots_data
             telemetry["shot_count"] = len(shots_data)
-            telemetry["valid_shot_count"] = len(valid_shots)
-            telemetry["has_valid_delivery"] = has_valid_delivery
             telemetry["best_shot"] = best_shot_idx
 
             tasks[task_id]["status"] = "completed"
             tasks[task_id]["stage"] = "completed"
             tasks[task_id]["progress"] = 100
             tasks[task_id]["shot_count"] = len(shots_data)
-            tasks[task_id]["valid_shot_count"] = len(valid_shots)
-            tasks[task_id]["has_valid_delivery"] = has_valid_delivery
             tasks[task_id]["completed_shots"] = len(shots_data)
             tasks[task_id]["best_shot"] = best_shot_idx
             tasks[task_id]["current_frame"] = telemetry.get("total_frames", tasks[task_id]["total_frames"])
@@ -585,27 +553,24 @@ def get_task_shots(task_id):
     tel = t.get("telemetry") or {}
     shots = extract_or_build_shots_data(tel)
     
-    # Determine best shot using validity filter
-    valid_shots = [s for s in shots if is_valid_delivery_shot(s)]
-    best_shot = None
-    if t.get("insights") and isinstance(t["insights"], dict) and t["insights"].get("best_shot"):
-        best_shot = t["insights"].get("best_shot")
-    elif valid_shots:
+    # Determine best shot
+    best_shot = 1
+    if t.get("insights") and isinstance(t["insights"], dict):
+        best_shot = t["insights"].get("best_shot", 1)
+    elif shots:
         best_item = max(
-            valid_shots,
-            key=lambda s: (float(s.get("release_speed_kmh", 0) or 0) + float(s.get("max_speed_kmh", 0) or 0))
+            shots,
+            key=lambda s: (float(s.get("release_speed_kmh", 0) or 0) + float(s.get("max_speed_kmh", 0) or 0)),
+            default=shots[0]
         )
         best_shot = best_item.get("shot", 1)
 
     for s in shots:
-        s["is_best"] = (best_shot is not None and s.get("shot") == best_shot)
-        s["is_valid_delivery"] = is_valid_delivery_shot(s)
+        s["is_best"] = (s.get("shot") == best_shot)
 
     return jsonify({
         "task_id": task_id,
         "shot_count": len(shots),
-        "valid_shot_count": len(valid_shots),
-        "has_valid_delivery": bool(valid_shots),
         "best_shot": best_shot,
         "shots": shots,
         "input_filename": t.get("input_filename", ""),
@@ -635,25 +600,24 @@ def get_task_shot_detail(task_id, shot_id):
     traj_pts = [p for p in tel.get("trajectory_points", []) if p.get("shot") == shot_id]
     frame_d = [f for f in tel.get("frame_data", []) if f.get("shot") == shot_id]
 
-    # Best shot determination using validity filter
-    valid_shots = [s for s in shots if is_valid_delivery_shot(s)]
-    best_shot = None
+    # Best shot determination
+    best_shot = 1
     insights_for_shot = None
-    if t.get("insights") and isinstance(t["insights"], dict) and t["insights"].get("best_shot"):
-        best_shot = t["insights"].get("best_shot")
+    if t.get("insights") and isinstance(t["insights"], dict):
+        best_shot = t["insights"].get("best_shot", 1)
         for ish in t["insights"].get("shots", []):
             if ish.get("shot") == shot_id:
                 insights_for_shot = ish
                 break
-    elif valid_shots:
+    elif shots:
         best_item = max(
-            valid_shots,
-            key=lambda s: (float(s.get("release_speed_kmh", 0) or 0) + float(s.get("max_speed_kmh", 0) or 0))
+            shots,
+            key=lambda s: (float(s.get("release_speed_kmh", 0) or 0) + float(s.get("max_speed_kmh", 0) or 0)),
+            default=shots[0]
         )
         best_shot = best_item.get("shot", 1)
 
-    matching_shot["is_best"] = (best_shot is not None and shot_id == best_shot)
-    matching_shot["is_valid_delivery"] = is_valid_delivery_shot(matching_shot)
+    matching_shot["is_best"] = (shot_id == best_shot)
     if insights_for_shot:
         matching_shot["insights"] = insights_for_shot
 
@@ -712,9 +676,6 @@ def _parse_gemini_insights(raw_text, shots_data):
         text = text[:-3]
     text = text.strip()
 
-    valid_shots = [s for s in shots_data if is_valid_delivery_shot(s)]
-    valid_nums = {s.get("shot") for s in valid_shots}
-
     # Try strict json parse
     try:
         data = json.loads(text)
@@ -725,34 +686,16 @@ def _parse_gemini_insights(raw_text, shots_data):
                 except Exception:
                     pass
             try:
-                cand_best = int(data.get("best_shot", 1))
-                if valid_nums and cand_best not in valid_nums:
-                    best_item = max(
-                        valid_shots,
-                        key=lambda s: (float(s.get("release_speed_kmh", 0) or 0) + float(s.get("max_speed_kmh", 0) or 0))
-                    )
-                    cand_best = best_item.get("shot")
-                data["best_shot"] = cand_best if valid_nums else None
+                data["best_shot"] = int(data.get("best_shot", 1))
             except Exception:
-                data["best_shot"] = next(iter(valid_nums)) if valid_nums else None
-            data["has_valid_delivery"] = bool(valid_nums)
+                data["best_shot"] = 1
             return data
     except Exception:
         pass
 
     # Heuristic fallback if JSON decoding fails or Gemini returned prose
-    if not valid_shots:
-        return {
-            "best_shot": None,
-            "has_valid_delivery": False,
-            "best_shot_title": "No Valid Delivery Detected",
-            "verdict": "No genuine cricket delivery was detected in this clip. Tracking metrics indicate non-delivery footage or background movement (all detected motion failed delivery speed and tracking rate gates).",
-            "shots": [],
-            "raw_markdown": raw_text
-        }
-
     best_shot_item = max(
-        valid_shots,
+        shots_data,
         key=lambda s: (float(s.get("release_speed_kmh", 0) or 0) + float(s.get("max_speed_kmh", 0) or 0)),
         default={}
     )
@@ -766,26 +709,24 @@ def _parse_gemini_insights(raw_text, shots_data):
         b_count = s.get("bounce_count", 0)
         ang = s.get("avg_angle", 0)
         dur = s.get("duration_sec", 0)
-        is_val = is_valid_delivery_shot(s)
 
         is_best = (s_num == best_num)
         parsed_shots.append({
             "shot": s_num,
-            "title": f"Shot {s_num}: Delivery Analysis" if is_val else f"Shot {s_num}: Non-Delivery Movement",
-            "delivery_type": ("Good Length Delivery" if b_count > 0 else "Full Yorker Attempt") if is_val else "Filtered Non-Delivery",
-            "threat_rating": ("8/10" if is_best else "6/10") if is_val else "1/10",
-            "summary": f"Delivery clocked at {rel} km/h release reaching {peak} km/h peak over {dur}s." if is_val else "Low confidence motion below genuine cricket delivery thresholds.",
+            "title": f"Shot {s_num}: Delivery Analysis",
+            "delivery_type": "Good Length Delivery" if b_count > 0 else "Full Yorker Attempt",
+            "threat_rating": "8/10" if is_best else "6/10",
+            "summary": f"Delivery clocked at {rel} km/h release reaching {peak} km/h peak over {dur}s.",
             "points": [
                 f"**Pace & Release**: Clocked at {rel} km/h release with {peak} km/h maximum velocity.",
                 f"**Pitch & Bounce**: {b_count} pitch contact event(s) recorded at {ang}° trajectory inclination.",
-                f"**Threat**: {'High challenge to batsman with sharp deck reaction.' if is_best else 'Solid control with steady line through the crease.' if is_val else 'Non-delivery movement poses no challenge.'}",
-                "**Coaching Tip**: Maintain forward momentum through the delivery stride." if is_val else "No coaching guidance needed for non-delivery frames."
+                f"**Threat**: {'High challenge to batsman with sharp deck reaction.' if is_best else 'Solid control with steady line through the crease.'}",
+                "**Coaching Tip**: Maintain forward momentum through the delivery stride."
             ]
         })
 
     return {
         "best_shot": best_num,
-        "has_valid_delivery": True,
         "best_shot_title": f"Shot {best_num} was the Standout Delivery",
         "verdict": f"Shot {best_num} was the most effective delivery of the spell, producing peak velocity ({best_shot_item.get('max_speed_kmh', 0)} km/h) and optimal deck impact.",
         "shots": parsed_shots,
@@ -813,45 +754,6 @@ def analyze_delivery(task_id):
     tel = t.get("telemetry", {}) or {}
     shots_data = extract_or_build_shots_data(tel)
     tel["shots_data"] = shots_data
-    valid_shots = [s for s in shots_data if is_valid_delivery_shot(s)]
-
-    if not valid_shots:
-        parsed_insights = {
-            "best_shot": None,
-            "has_valid_delivery": False,
-            "best_shot_title": "No Valid Delivery Detected",
-            "verdict": "No genuine cricket delivery was detected in this session. The detected movement did not meet cricket bowling speed, tracking rate, or kinematic delivery thresholds.",
-            "shots": []
-        }
-        for s in shots_data:
-            s["is_best"] = False
-            s["is_valid_delivery"] = False
-
-        tasks[task_id]['insights'] = parsed_insights
-        tasks[task_id]['best_shot'] = None
-        tasks[task_id]['has_valid_delivery'] = False
-        if 'telemetry' in tasks[task_id] and tasks[task_id]['telemetry']:
-            tasks[task_id]['telemetry']['shots_data'] = shots_data
-            tasks[task_id]['telemetry']['shots'] = shots_data
-            tasks[task_id]['telemetry']['best_shot'] = None
-            tasks[task_id]['telemetry']['has_valid_delivery'] = False
-        _add_to_history(task_id, tasks[task_id])
-
-        return jsonify({
-            "task_id": task_id,
-            "has_valid_delivery": False,
-            "insights": parsed_insights,
-            "shots_data": shots_data,
-            "data_summary": {
-                "release_kmh": 0.0,
-                "avg_kmh": 0.0,
-                "peak_kmh": 0.0,
-                "bounce_count": 0,
-                "total_shots": len(shots_data),
-                "valid_shots": 0,
-                "best_shot": None
-            }
-        })
 
     speed = tel.get("speed_summary", {}) or {}
     bounces = tel.get("bounce_events", []) or []
@@ -863,16 +765,14 @@ def analyze_delivery(task_id):
     avg_kmh = speed.get("avg_speed_kmh", 0)
     peak_kmh = speed.get("max_speed_kmh", 0)
 
-    # Format shot summaries for the prompt (prioritizing genuine deliveries)
+    # Format shot summaries for the prompt
     shot_prompts = []
     for s in shots_data:
         s_num = s["shot"]
-        is_val = is_valid_delivery_shot(s)
         b_list = s.get("bounces", [])
         b_desc = ", ".join([f"Frame {b.get('frame')} @ {b.get('angle')}° ({b.get('speed_kmh')} km/h)" for b in b_list]) if b_list else "None (full flight)"
         shot_prompts.append(
-            f"SHOT {s_num}{' (Genuine Delivery)' if is_val else ' (Low Confidence / Non-Delivery Motion)'}:\n"
-            f"  - Valid Delivery: {is_val}\n"
+            f"SHOT {s_num}:\n"
             f"  - Timing: {s.get('start_sec')}s - {s.get('end_sec')}s ({s.get('duration_sec')}s duration)\n"
             f"  - Release Speed: {s.get('release_speed_kmh')} km/h ({s.get('release_speed_mph')} mph)\n"
             f"  - Avg Speed: {s.get('avg_speed_kmh')} km/h | Peak Speed: {s.get('max_speed_kmh')} km/h\n"
@@ -884,7 +784,6 @@ def analyze_delivery(task_id):
     try:
         prompt = f"""You are HawkVision AI, an elite cricket bowling performance analyst and biomechanics coach.
 Analyze this video session containing {total_shots} cricket delivery shot(s).
-Important: Only genuine deliveries marked Valid Delivery: True should be chosen as best shot.
 
 === TELEMETRY BY SHOT ===
 {shots_summary_text}
@@ -948,28 +847,24 @@ CRITICAL FORMATTING RULE: NEVER use LaTeX math or dollar signs (do NOT use dolla
         parsed_insights = _parse_gemini_insights(raw_insights, shots_data)
 
         # Update each shot's insights and is_best flag
-        best_shot_idx = parsed_insights.get("best_shot")
+        best_shot_idx = parsed_insights.get("best_shot", 1)
         insights_by_shot = {s.get("shot"): s for s in parsed_insights.get("shots", [])}
         for s in shots_data:
-            s["is_best"] = (best_shot_idx is not None and s.get("shot") == best_shot_idx)
-            s["is_valid_delivery"] = is_valid_delivery_shot(s)
+            s["is_best"] = (s.get("shot") == best_shot_idx)
             if s.get("shot") in insights_by_shot:
                 s["insights"] = insights_by_shot[s.get("shot")]
 
         # Save insights into task + persist history
         tasks[task_id]['insights'] = parsed_insights
         tasks[task_id]['best_shot'] = best_shot_idx
-        tasks[task_id]['has_valid_delivery'] = bool(valid_shots)
         if 'telemetry' in tasks[task_id] and tasks[task_id]['telemetry']:
             tasks[task_id]['telemetry']['shots_data'] = shots_data
             tasks[task_id]['telemetry']['shots'] = shots_data
             tasks[task_id]['telemetry']['best_shot'] = best_shot_idx
-            tasks[task_id]['telemetry']['has_valid_delivery'] = bool(valid_shots)
         _add_to_history(task_id, tasks[task_id])
 
         return jsonify({
             "task_id": task_id,
-            "has_valid_delivery": bool(valid_shots),
             "insights": parsed_insights,
             "shots_data": shots_data,
             "data_summary": {
@@ -978,8 +873,7 @@ CRITICAL FORMATTING RULE: NEVER use LaTeX math or dollar signs (do NOT use dolla
                 "peak_kmh": peak_kmh,
                 "bounce_count": len(bounces),
                 "total_shots": total_shots,
-                "valid_shots": len(valid_shots),
-                "best_shot": best_shot_idx
+                "best_shot": parsed_insights.get("best_shot", 1)
             }
         })
 

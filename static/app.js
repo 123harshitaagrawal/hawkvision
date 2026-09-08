@@ -508,25 +508,15 @@ function openFullContinuousVideo(autoPlay = true, autoScroll = true) {
     const mainSpd = document.getElementById('statSpeedMain');
     const subSpd = document.getElementById('statSpeedSub');
     const spdSummary = tel.speed_summary || {};
-    const hasValidDelivery = (task.has_valid_delivery !== false && tel.has_valid_delivery !== false && (task.best_shot !== null || (insights && insights.best_shot !== null)));
     const peakSpd = spdSummary.peak_speed_kmh || (shots.length ? Math.max(...shots.map(s => s.max_speed_kmh || s.release_speed_kmh || 0)) : null);
-    const validAvgShots = shots.filter(s => s.avg_speed_kmh && (s.is_valid_delivery !== false));
+    const validAvgShots = shots.filter(s => s.avg_speed_kmh);
     const avgSpd = spdSummary.avg_speed_kmh || (validAvgShots.length ? Math.round(validAvgShots.reduce((acc, s) => acc + s.avg_speed_kmh, 0) / validAvgShots.length) : null);
 
     if (mainSpd) {
-        if (!hasValidDelivery) {
-            mainSpd.innerText = '-- km/h';
-        } else {
-            mainSpd.innerText = peakSpd ? `${peakSpd} km/h` : (avgSpd ? `${avgSpd} km/h` : '-- km/h');
-        }
+        mainSpd.innerText = peakSpd ? `${peakSpd} km/h` : (avgSpd ? `${avgSpd} km/h` : '-- km/h');
     }
     if (subSpd) {
-        if (!hasValidDelivery) {
-            subSpd.innerText = `No genuine delivery detected (filtered ${shots.length} candidate(s))`;
-        } else {
-            const bestId = insights.best_shot || task.best_shot || 1;
-            subSpd.innerText = `Spell Avg: ${avgSpd || '--'} km/h | Deliveries: ${shots.length || 1} | Best: Shot ${bestId}`;
-        }
+        subSpd.innerText = `Spell Avg: ${avgSpd || '--'} km/h | Deliveries: ${shots.length || 1} | Best: Shot ${insights.best_shot || task.best_shot || 1}`;
     }
 
     const rateElem = document.getElementById('statTrackedRate');
@@ -885,70 +875,37 @@ function renderActiveShotContent(shotId) {
         // Structured Gemini Insights
         if (shotId === 'best') {
             // Comparative Verdict Overview
-            const hasValid = (insights.has_valid_delivery !== false && insights.best_shot !== null);
-            const bestNum = insights.best_shot;
-
-            if (!hasValid || !bestNum) {
-                contentHtml = `
-                    <div class="best-shot-banner" style="border-left: 4px solid #ef4444; background: rgba(239, 68, 68, 0.1);">
-                        <div class="best-shot-badge-top" style="background: rgba(239, 68, 68, 0.2); color: #fca5a5;">⚠️ NO VALID DELIVERY DETECTED</div>
-                        <h3 class="best-shot-headline">${escapeHtml(insights.best_shot_title || 'Non-Delivery Footage Filtered')}</h3>
-                        <p class="best-shot-verdict-text">${escapeHtml(insights.verdict || 'Tracking metrics indicate non-delivery footage or background movement (all candidates failed bowling speed and tracking gates).')}</p>
-                    </div>
-                    <div class="shots-summary-headline">Filtered Candidates:</div>
-                    <div class="shots-compare-grid">
-                        ${shotsData.map(s => {
-                            const sInsight = (insights.shots || []).find(x => x.shot === s.shot);
-                            return `
-                                <div class="shot-mini-card" onclick="selectShot(${s.shot})">
-                                    <div class="mini-card-head">
-                                        <div class="mini-card-shot-num">Candidate ${s.shot}</div>
-                                        <span class="badge" style="background:rgba(239,68,68,0.2); color:#fca5a5;">Non-Delivery</span>
-                                    </div>
-                                    <div class="mini-card-type">${escapeHtml(sInsight?.delivery_type || 'Filtered Motion')}</div>
-                                    <div class="mini-card-metrics">
-                                        <div class="mini-metric"><span>Release:</span> <strong>${s.release_speed_kmh} km/h</strong></div>
-                                        <div class="mini-metric"><span>Peak:</span> <strong>${s.max_speed_kmh} km/h</strong></div>
-                                        <div class="mini-metric"><span>Tracking:</span> <strong>${s.tracking_rate || 0}%</strong></div>
-                                    </div>
-                                    <div class="mini-card-action">View Inspection Breakdown →</div>
+            const bestNum = insights.best_shot || 1;
+            contentHtml = `
+                <div class="best-shot-banner">
+                    <div class="best-shot-badge-top">🏆 BEST SHOT VERDICT</div>
+                    <h3 class="best-shot-headline">${escapeHtml(insights.best_shot_title || ('Shot ' + bestNum + ' was the Standout Delivery'))}</h3>
+                    <p class="best-shot-verdict-text">${escapeHtml(insights.verdict || '')}</p>
+                </div>
+                <div class="shots-summary-headline">All Deliveries Comparison:</div>
+                <div class="shots-compare-grid">
+                    ${shotsData.map(s => {
+                        const isWinner = (s.shot === bestNum);
+                        const sInsight = insights.shots.find(x => x.shot === s.shot);
+                        return `
+                            <div class="shot-mini-card ${isWinner ? 'winner-card' : ''}" onclick="selectShot(${s.shot})">
+                                <div class="mini-card-head">
+                                    <div class="mini-card-shot-num">Shot ${s.shot}</div>
+                                    ${isWinner ? '<span class="badge badge-winner">⭐ Best Shot</span>' : ''}
+                                    <span class="badge badge-threat">${escapeHtml(sInsight?.threat_rating || '7/10')}</span>
                                 </div>
-                            `;
-                        }).join('')}
-                    </div>
-                `;
-            } else {
-                contentHtml = `
-                    <div class="best-shot-banner">
-                        <div class="best-shot-badge-top">🏆 BEST SHOT VERDICT</div>
-                        <h3 class="best-shot-headline">${escapeHtml(insights.best_shot_title || ('Shot ' + bestNum + ' was the Standout Delivery'))}</h3>
-                        <p class="best-shot-verdict-text">${escapeHtml(insights.verdict || '')}</p>
-                    </div>
-                    <div class="shots-summary-headline">All Deliveries Comparison:</div>
-                    <div class="shots-compare-grid">
-                        ${shotsData.map(s => {
-                            const isWinner = (s.shot === bestNum);
-                            const sInsight = (insights.shots || []).find(x => x.shot === s.shot);
-                            return `
-                                <div class="shot-mini-card ${isWinner ? 'winner-card' : ''}" onclick="selectShot(${s.shot})">
-                                    <div class="mini-card-head">
-                                        <div class="mini-card-shot-num">Shot ${s.shot}</div>
-                                        ${isWinner ? '<span class="badge badge-winner">⭐ Best Shot</span>' : ''}
-                                        <span class="badge badge-threat">${escapeHtml(sInsight?.threat_rating || '7/10')}</span>
-                                    </div>
-                                    <div class="mini-card-type">${escapeHtml(sInsight?.delivery_type || 'Delivery ' + s.shot)}</div>
-                                    <div class="mini-card-metrics">
-                                        <div class="mini-metric"><span>Release:</span> <strong>${s.release_speed_kmh} km/h</strong></div>
-                                        <div class="mini-metric"><span>Peak:</span> <strong>${s.max_speed_kmh} km/h</strong></div>
-                                        <div class="mini-metric"><span>Bounces:</span> <strong>${s.bounce_count}</strong></div>
-                                    </div>
-                                    <div class="mini-card-action">View Shot ${s.shot} Breakdown →</div>
+                                <div class="mini-card-type">${escapeHtml(sInsight?.delivery_type || 'Delivery ' + s.shot)}</div>
+                                <div class="mini-card-metrics">
+                                    <div class="mini-metric"><span>Release:</span> <strong>${s.release_speed_kmh} km/h</strong></div>
+                                    <div class="mini-metric"><span>Peak:</span> <strong>${s.max_speed_kmh} km/h</strong></div>
+                                    <div class="mini-metric"><span>Bounces:</span> <strong>${s.bounce_count}</strong></div>
                                 </div>
-                            `;
-                        }).join('')}
-                    </div>
-                `;
-            }
+                                <div class="mini-card-action">View Shot ${s.shot} Breakdown →</div>
+                            </div>
+                        `;
+                    }).join('')}
+                </div>
+            `;
         } else {
             // Individual Shot Breakdown
             const sNum = parseInt(shotId);
@@ -1007,17 +964,6 @@ function displayResults(task) {
     const tel = task.telemetry || {};
     window.currentShotsData = (tel.shots_data && tel.shots_data.length > 0) ? tel.shots_data : [];
     window.currentInsights = task.insights || null;
-
-    // Toggle No Valid Delivery Alert Banner
-    const noDelivAlert = document.getElementById('noDeliveryAlert');
-    const hasValid = (task.has_valid_delivery !== false && tel.has_valid_delivery !== false && task.best_shot !== null);
-    if (noDelivAlert) {
-        if (!hasValid) {
-            noDelivAlert.classList.remove('hidden');
-        } else {
-            noDelivAlert.classList.add('hidden');
-        }
-    }
 
     // Enable AI Insights button
     const analyzeBtn = document.getElementById('analyzeBtn');
@@ -1081,10 +1027,9 @@ function renderShotsDashboard(task, shotsData) {
     }
 
     // Find standout / best shot
-    const hasValid = (task.has_valid_delivery !== false && (!task.telemetry || task.telemetry.has_valid_delivery !== false) && task.best_shot !== null);
-    const bestNum = hasValid 
-        ? ((window.currentInsights && window.currentInsights.best_shot) ? window.currentInsights.best_shot : (task.best_shot || 1))
-        : null;
+    const bestNum = (window.currentInsights && window.currentInsights.best_shot) 
+        ? window.currentInsights.best_shot 
+        : (task.best_shot || 1);
 
     // Calculate maximum release speed
     let maxRelease = 0;
@@ -1094,17 +1039,10 @@ function renderShotsDashboard(task, shotsData) {
     });
 
     if (summaryElem) {
-        if (!hasValid) {
-            summaryElem.innerHTML = `
-                <strong style="color:#ef4444;">No genuine delivery detected</strong> • Filtered <strong>${shotsData.length} candidate motion window(s)</strong> • 
-                Standout: <span style="color:#ef4444; font-weight:700;">None (Sub-delivery speed / non-cricket movement)</span>.
-            `;
-        } else {
-            summaryElem.innerHTML = `
-                <strong>${shotsData.length} auto-segmented deliveries</strong> • Peak release: <strong>${maxRelease > 0 ? maxRelease + ' km/h' : '--'}</strong> • 
-                Standout: <span style="color:#eeb20d; font-weight:800;">Shot ${bestNum}</span>. Click any delivery card below to inspect telemetry & video.
-            `;
-        }
+        summaryElem.innerHTML = `
+            <strong>${shotsData.length} auto-segmented deliveries</strong> • Peak release: <strong>${maxRelease > 0 ? maxRelease + ' km/h' : '--'}</strong> • 
+            Standout: <span style="color:#eeb20d; font-weight:800;">Shot ${bestNum}</span>. Click any delivery card below to inspect telemetry & video.
+        `;
     }
 
     container.innerHTML = shotsData.map(s => {
@@ -1251,21 +1189,12 @@ function openShotDetail(shotNumber, autoPlay = true) {
     if (shot) {
         const mainSpd = document.getElementById('statSpeedMain');
         const subSpd = document.getElementById('statSpeedSub');
-        const isShotValid = (shot.is_valid_delivery !== false && (parseFloat(shot.release_speed_kmh || 0) >= 20 || parseFloat(shot.avg_speed_kmh || 0) >= 20));
         if (mainSpd) {
             const relVal = shot.release_speed_kmh || shot.avg_speed_kmh;
-            if (!isShotValid) {
-                mainSpd.innerText = relVal ? `${relVal} km/h (Filtered)` : '-- km/h';
-            } else {
-                mainSpd.innerText = relVal ? `${relVal} km/h` : '-- km/h';
-            }
+            mainSpd.innerText = relVal ? `${relVal} km/h` : '-- km/h';
         }
         if (subSpd) {
-            if (!isShotValid) {
-                subSpd.innerText = `Filtered motion: Below bowling speed threshold`;
-            } else {
-                subSpd.innerText = `Avg: ${shot.avg_speed_kmh || '--'} km/h | Peak: ${shot.max_speed_kmh || '--'} km/h`;
-            }
+            subSpd.innerText = `Avg: ${shot.avg_speed_kmh || '--'} km/h | Peak: ${shot.max_speed_kmh || '--'} km/h`;
         }
 
         const rateElem = document.getElementById('statTrackedRate');
