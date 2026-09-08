@@ -37,6 +37,52 @@ def detect_faces_fast(frame, target_w=160, target_h=90):
     except Exception:
         return []
 
+def get_distance_to_box(cx, cy, box):
+    """
+    Euclidean distance from point (cx, cy) to edge of box [x1, y1, x2, y2].
+    Returns 0.0 if (cx, cy) is inside the box.
+    Returns float('inf') if box is None.
+    """
+    if box is None:
+        return float('inf')
+    x1, y1, x2, y2 = box
+    dx = max(x1 - cx, 0.0, cx - x2)
+    dy = max(y1 - cy, 0.0, cy - y2)
+    return math.hypot(dx, dy)
+
+def get_distance_to_nearest_person(cx, cy, person_boxes):
+    """Euclidean distance from (cx, cy) to edge of nearest person box."""
+    if not person_boxes:
+        return float('inf')
+    return min(get_distance_to_box(cx, cy, b) for b in person_boxes)
+
+def identify_bowler_and_batsman(person_boxes, bowler_release_zone, width, height):
+    """
+    Classify detected persons into (bowler_box, batsman_box) based on release zone.
+    Bowler is the person nearest to the release zone.
+    Batsman is the person furthest down-pitch from release zone.
+    """
+    if not person_boxes:
+        return None, None
+    if len(person_boxes) == 1:
+        return person_boxes[0], None
+    
+    if bowler_release_zone is not None:
+        rx, ry = bowler_release_zone
+        closest_idx = -1
+        min_dist = float('inf')
+        for idx, box in enumerate(person_boxes):
+            d = get_distance_to_box(rx, ry, box)
+            if d < min_dist:
+                min_dist = d
+                closest_idx = idx
+        bowler_box = person_boxes[closest_idx]
+        other_boxes = [b for i, b in enumerate(person_boxes) if i != closest_idx]
+        batsman_box = max(other_boxes, key=lambda b: get_distance_to_box(rx, ry, b)) if other_boxes else None
+        return bowler_box, batsman_box
+    else:
+        return person_boxes[0], (person_boxes[1] if len(person_boxes) > 1 else None)
+
 def angle_between_lines(m1, m2=1):
     """Calculate the angle between two lines."""
     if m1 != -1 / m2:
@@ -737,6 +783,37 @@ class CricketTrajectoryPredictor:
         self.history_len = history_len
         self.pred_steps = pred_steps
 
+        # Person detector for body-attachment gating
+        person_model_paths = [
+            'yolov8n.pt',
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'yolov8n.pt'),
+            os.path.join('Cricket-Ball-Trajectory-Prediction-master', 'yolov8n.pt'),
+            'yolov8s.pt'
+        ]
+        person_model_path = None
+        for p in person_model_paths:
+            if os.path.exists(p):
+                person_model_path = p
+                break
+        if person_model_path is None:
+            person_model_path = 'yolov8n.pt'
+        self.person_model_path = person_model_path
+        self._person_model = None
+
+    @property
+    def person_model(self):
+        if self._person_model is None:
+            try:
+                self._person_model = YOLO(self.person_model_path)
+                if self.device is not None:
+                    try:
+                        self._person_model.to(self.device)
+                    except Exception:
+                        pass
+            except Exception:
+                self._person_model = None
+        return self._person_model
+
     def draw_glowing_path(self, frame, points, color_bgr=(0, 230, 255), core_color=(255, 255, 255), 
                           use_bezier=True, show_nodes=True):
         """Draw a high-visibility Hawkeye glowing path with nodes."""
@@ -994,6 +1071,11 @@ class CricketTrajectoryPredictor:
             frame_buffer = deque()
             pending_bounce = None
             cached_faces = []
+            cached_persons = []
+            bowler_box = None
+            batsman_box = None
+            recent_bowler_separations = deque(maxlen=15)
+            has_separated_from_bowler = False
 
             # Seek video directly to the start of this delivery window
             shot_video_start_frame = processed_frames
@@ -1013,6 +1095,25 @@ class CricketTrajectoryPredictor:
                 # Update face mask periodically during discovery
                 if (frame_idx % 4 == 0 or kalman is None) and _FACE_CASCADE is not None:
                     cached_faces = detect_faces_fast(frame)
+
+                # Update person detector on 3-frame stride (low-cost, ~16ms/frame on CPU, <1ms GPU)
+                if (frame_idx % 3 == 0 or not cached_persons) and self.person_model is not None:
+                    try:
+                        p_res = self.person_model.predict(frame, classes=[0], conf=0.25, imgsz=320, verbose=False)
+                        if len(p_res) > 0 and p_res[0].boxes is not None and len(p_res[0].boxes) > 0:
+                            cached_persons = [list(map(float, b)) for b in p_res[0].boxes.xyxy.cpu().numpy()]
+                        else:
+                            cached_persons = []
+                    except Exception:
+                        pass
+
+                # Update bowler & batsman classification
+                if cached_persons:
+                    b_cand, bat_cand = identify_bowler_and_batsman(cached_persons, bowler_release_zone, width, height)
+                    if b_cand is not None:
+                        bowler_box = b_cand
+                    if bat_cand is not None:
+                        batsman_box = bat_cand
 
                 # 1. Predict with Kalman filter if active
                 predicted_pos = None
@@ -1044,15 +1145,39 @@ class CricketTrajectoryPredictor:
                             continue  # Bats, limbs, long shadows
                         circularity = 1.0 - abs(1.0 - aspect)  # 1.0 = perfect square
 
-                        # --- Gate 1A: Absolute Bounding Box Size Ceiling ---
-                        # Reject large boxes (faces, heads, hands, bats) while comfortably admitting close nets ball
-                        max_w_allowed = width * 0.11
-                        max_h_allowed = height * 0.13
-                        if bw > max_w_allowed or bh > max_h_allowed or (bw * bh) > (width * height * 0.013):
-                            continue
-
                         cx = (x1 + x2) / 2.0
                         cy = (y1 + y2) / 2.0
+
+                        # --- Body-Attachment & Role Gating ---
+                        dist_to_bowler = get_distance_to_box(cx, cy, bowler_box) if bowler_box is not None else float('inf')
+                        dist_to_nearest_person = get_distance_to_nearest_person(cx, cy, cached_persons)
+
+                        # Body adjacency logic:
+                        # If bowler_box is known, test distance to bowler.
+                        # If bowler_box is None (safe fallback), test distance to nearest person if track hasn't separated.
+                        is_near_bowler = (dist_to_bowler < width * 0.12)
+                        if bowler_box is None and cached_persons:
+                            if not has_separated_from_bowler:
+                                is_near_bowler = (dist_to_nearest_person < width * 0.12)
+                        elif bowler_box is None and not cached_persons and bowler_release_zone is not None:
+                            if not has_separated_from_bowler:
+                                dist_from_release = math.hypot(cx - bowler_release_zone[0], cy - bowler_release_zone[1])
+                                is_near_bowler = (dist_from_release < width * 0.12)
+
+                        # --- Gate 1A: Absolute Bounding Box Size Ceiling ---
+                        # Body-adjacent candidates near bowler get strict ceiling to block wristbands / hands.
+                        # Free-flying candidates get relaxed ceiling to comfortably admit close nets ball.
+                        if is_near_bowler:
+                            max_w_allowed = width * 0.06
+                            max_h_allowed = height * 0.07
+                            max_area_allowed = width * height * 0.0045
+                        else:
+                            max_w_allowed = width * 0.11
+                            max_h_allowed = height * 0.13
+                            max_area_allowed = width * height * 0.013
+
+                        if bw > max_w_allowed or bh > max_h_allowed or (bw * bh) > max_area_allowed:
+                            continue
 
                         # --- Gate 1B: Face Exclusion Mask ---
                         # Reject candidates whose centers fall directly inside a detected human face
@@ -1091,14 +1216,22 @@ class CricketTrajectoryPredictor:
 
                             # Check if candidate matches a reflected bounce trajectory
                             effective_dist = dist
-                            if current_phase == 1 and len(full_trajectory) >= 3 and pred_y > height * 0.30:
+                            if current_phase == 1 and len(full_trajectory) >= 3:
                                 vy_est = kalman.x[3]
                                 if vy_est > 0.8:
-                                    bounce_y_pred = pred_y - 1.55 * vy_est * kalman.dt
-                                    dist_reflected = math.hypot(cx - pred_x, cy - bounce_y_pred)
-                                    if dist_reflected < dist and dist_reflected < KALMAN_GATE_RADIUS * 1.8 and cy <= pred_y + 8:
-                                        effective_dist = dist_reflected
-                                        is_rebound_cand = True
+                                    # REBOUND PERMISSION RULES:
+                                    # 1. Pitch bounce CANNOT occur on or adjacent to the bowler's body.
+                                    #    Track must have separated from bowler (has_separated_from_bowler),
+                                    #    and candidate cannot be near bowler (not is_near_bowler).
+                                    # 2. Near batsman, rebound is permitted based on parabolic reflection.
+                                    rebound_permitted = (not is_near_bowler) and (has_separated_from_bowler or bowler_box is None)
+
+                                    if rebound_permitted:
+                                        bounce_y_pred = pred_y - 1.55 * vy_est * kalman.dt
+                                        dist_reflected = math.hypot(cx - pred_x, cy - bounce_y_pred)
+                                        if dist_reflected < dist and dist_reflected < KALMAN_GATE_RADIUS * 1.8 and cy <= pred_y + 8:
+                                            effective_dist = dist_reflected
+                                            is_rebound_cand = True
 
                             base_gate = KALMAN_GATE_RADIUS * 2.2 if post_bounce_boost_frames > 0 else KALMAN_GATE_RADIUS
                             strict_gate = KALMAN_GATE_RADIUS * 1.5 if post_bounce_boost_frames > 0 else KALMAN_STRICT_RADIUS
@@ -1108,6 +1241,9 @@ class CricketTrajectoryPredictor:
                                 continue
 
                             min_conf = 0.18 if (post_bounce_boost_frames > 0 or is_rebound_cand) else MIN_CONF_TRACKING
+                            if is_near_bowler:
+                                min_conf = max(min_conf, 0.45)
+
                             if conf < min_conf:
                                 continue
 
@@ -1115,6 +1251,8 @@ class CricketTrajectoryPredictor:
                             score = (conf * 0.45) + (proximity_weight * 0.45) + (circularity * 0.10)
                         else:
                             disc_conf = 0.25 if post_bounce_boost_frames > 0 else MIN_CONF_DISCOVERY
+                            if is_near_bowler:
+                                disc_conf = max(disc_conf, 0.55)
                             if conf < disc_conf:
                                 continue
                             score = (conf * 0.75) + (circularity * 0.25)
@@ -1174,6 +1312,18 @@ class CricketTrajectoryPredictor:
                             if bowler_release_zone is None:
                                 bowler_release_zone = current_centroid
 
+                            # Track bowler separation
+                            if bowler_box is not None:
+                                sep = get_distance_to_box(cx, cy, bowler_box)
+                                recent_bowler_separations.append(sep)
+                                if sep >= width * 0.15:
+                                    has_separated_from_bowler = True
+                            elif bowler_release_zone is not None:
+                                sep = math.hypot(cx - bowler_release_zone[0], cy - bowler_release_zone[1])
+                                recent_bowler_separations.append(sep)
+                                if sep >= width * 0.15:
+                                    has_separated_from_bowler = True
+
                     else:
                         if pending_candidate is not None:
                             px, py, pc = pending_candidate
@@ -1191,6 +1341,18 @@ class CricketTrajectoryPredictor:
                                 shot_detected_frames += 1
                                 if bowler_release_zone is None:
                                     bowler_release_zone = current_centroid
+
+                                # Track bowler separation
+                                if bowler_box is not None:
+                                    sep = get_distance_to_box(cx, cy, bowler_box)
+                                    recent_bowler_separations.append(sep)
+                                    if sep >= width * 0.15:
+                                        has_separated_from_bowler = True
+                                elif bowler_release_zone is not None:
+                                    sep = math.hypot(cx - bowler_release_zone[0], cy - bowler_release_zone[1])
+                                    recent_bowler_separations.append(sep)
+                                    if sep >= width * 0.15:
+                                        has_separated_from_bowler = True
                             else:
                                 pending_candidate = (cx, cy, conf)
                                 pending_candidate_count = 1
@@ -1206,26 +1368,6 @@ class CricketTrajectoryPredictor:
                     if kalman is not None and missed_frames < max_missed_frames:
                         missed_frames += 1
                         is_estimated = True
-                        # If in Phase 1 and missed right around the bounce area:
-                        if current_phase == 1 and len(full_trajectory) >= 3 and kalman.x[1] > height * 0.40 and kalman.x[3] > 0:
-                            kalman.reflect_bounce(restitution=0.55)
-                            current_phase = 2
-                            post_bounce_boost_frames = 8
-                            if bounce_point is None and len(full_trajectory) > 0:
-                                bounce_point = full_trajectory[-1]
-                                pending_bounce = {
-                                    "shot": shot_idx + 1,
-                                    "frame": frame_idx,
-                                    "timestamp": round(frame_idx / fps, 2),
-                                    "angle": round(last_angle, 1),
-                                    "speed_kmh": current_speed_kmh,
-                                    "speed_mph": current_speed_mph,
-                                    "position": list(bounce_point),
-                                    "observed_phase2_frames": 0,
-                                    "phase2_displacements": [],
-                                    "confirmed": False
-                                }
-
                         kx, ky = kalman.get_pos()
                         if 0 <= kx < width and 0 <= ky < height:
                             current_centroid = (kx, ky)

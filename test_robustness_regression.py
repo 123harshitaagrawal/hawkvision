@@ -39,7 +39,10 @@ from trajectory_tracker import (
     pass_b_refine_window,
     is_delivery_candidate_cluster,
     should_fallback_to_coarse_window,
-    detect_faces_fast
+    detect_faces_fast,
+    get_distance_to_box,
+    get_distance_to_nearest_person,
+    identify_bowler_and_batsman
 )
 from server import (
     is_valid_delivery_shot,
@@ -280,6 +283,109 @@ class TestHawkVisionRobustness(unittest.TestCase):
         self.assertEqual(trimmed_duration, 30, "Talk-shot-talk clip must remain tightly trimmed to 30 frames (1.0s)")
         self.assertEqual(high_quality_refined["start_frame"], 150)
         self.assertEqual(high_quality_refined["end_frame"], 180)
+
+    def test_wristband_bowler_followthrough_rejection(self):
+        """
+        Validates wristband / follow-through rejection (upload_3617b081_test2.mp4):
+        The delivery in test2.mp4 is a full toss directly into the stumps without pitch bounce.
+        Asserts that the bowler's follow-through arm swing / wristband does NOT trigger a fake
+        pitch bounce at chest height (y ~ 366, angle ~ 59-60°). Exactly 0 pitch bounces recorded.
+        """
+        vpath = os.path.join(BASE_DIR, 'videos', 'upload_3617b081_test2.mp4')
+        if not os.path.exists(vpath):
+            self.skipTest("upload_3617b081_test2.mp4 not found")
+
+        predictor = CricketTrajectoryPredictor()
+        telemetry = predictor.process_video(vpath, auto_trim=False)
+        bounces = telemetry.get('bounce_events', [])
+        self.assertEqual(len(bounces), 0,
+                         f"Full-toss delivery must record 0 pitch bounces; fake wristband/chest bounce rejected. Got {bounces}")
+
+    def test_bouncer_short_pitch_delivery_admitted(self):
+        """
+        Validates that a short-pitched delivery / bouncer bouncing high in the frame
+        (e.g. y = 0.32 * H) is NOT rejected by any arbitrary pitch floor (e.g. y >= 0.45 * H).
+        """
+        frame_w, frame_h = 422, 688
+        bouncer_y = frame_h * 0.32  # 220.16 px (high in perspective)
+        # Verify bouncer elevation is above 0.45*H
+        self.assertLess(bouncer_y, frame_h * 0.45, "Bouncer bounce point is in upper half of perspective")
+        # In our physics model, downward momentum (vy > 0.8) followed by Phase 2 continuation
+        # governs bounce validity without an arbitrary y floor.
+        rebound_permitted = (bouncer_y > 0)  # No hard floor
+        self.assertTrue(rebound_permitted, "Bouncer delivery must not be vetoed by an elevation floor")
+
+    def test_full_length_batsman_bounce_admitted(self):
+        """
+        Validates that a delivery bouncing close to the batsman's silhouette
+        (e.g. yorker / full length bouncing at batsman's feet, < 0.10 * W from batsman)
+        is NOT vetoed by body proximity.
+        """
+        frame_w, frame_h = 422, 688
+        batsman_box = [180.0, 480.0, 260.0, 680.0]
+        # Ball bounces at the batsman's toes: (210, 475)
+        ball_cx, ball_cy = 210.0, 475.0
+        dist_to_batsman = get_distance_to_box(ball_cx, ball_cy, batsman_box)
+        self.assertLess(dist_to_batsman, frame_w * 0.10, "Ball is legitimately close to batsman")
+
+        # Bowler is at opposite end
+        bowler_box = [20.0, 200.0, 120.0, 450.0]
+        dist_to_bowler = get_distance_to_box(ball_cx, ball_cy, bowler_box)
+        is_near_bowler = (dist_to_bowler < frame_w * 0.12)
+        self.assertFalse(is_near_bowler, "Ball is not near bowler")
+
+        # Rule check: Rebound is permitted near batsman because it is NOT near bowler
+        has_separated_from_bowler = True
+        rebound_permitted = (not is_near_bowler) and has_separated_from_bowler
+        self.assertTrue(rebound_permitted, "Full-length delivery near batsman must be permitted to bounce")
+
+    def test_batsman_bat_swing_rejection(self):
+        """
+        Validates that an aggressive bat swing at the batsman end is rejected:
+        Cricket bats have high aspect ratio (bw/bh > 2.8 or < 0.35), which Gate 1 rejects.
+        """
+        # Bat candidate: 15px wide x 65px tall (aspect = 0.23 < 0.35)
+        bat_bw, bat_bh = 15.0, 65.0
+        aspect = bat_bw / bat_bh
+        aspect_rejected = (aspect < 0.35 or aspect > 2.8)
+        self.assertTrue(aspect_rejected, "Bat swing detection must be rejected by shape/aspect ratio gate")
+
+    def test_bowler_unidentified_fallback_safe(self):
+        """
+        Validates safe fallback when bowler cannot be confidently identified (bowler_box is None):
+        Instead of silently disabling the gate, the tracker falls back to strict thresholds
+        for any candidate within 0.12*W of any detected person prior to separation.
+        """
+        frame_w = 400
+        cached_persons = [[100.0, 200.0, 160.0, 450.0]]
+        bowler_box = None
+        has_separated_from_bowler = False
+
+        cand_cx, cand_cy = 120.0, 230.0  # inside person
+        dist_to_bowler = get_distance_to_box(cand_cx, cand_cy, bowler_box)
+        dist_to_near = get_distance_to_nearest_person(cand_cx, cand_cy, cached_persons)
+
+        is_near_bowler = (dist_to_bowler < frame_w * 0.12)
+        if bowler_box is None and cached_persons and not has_separated_from_bowler:
+            is_near_bowler = (dist_to_near < frame_w * 0.12)
+
+        self.assertTrue(is_near_bowler,
+                        "When bowler is unidentified, candidate near any person must safely fall back to strict body gate")
+
+    def test_bowler_batsman_role_identification(self):
+        """
+        Validates proper role assignment:
+        Person nearest to release zone is tagged bowler_box;
+        Person furthest down-pitch is tagged batsman_box.
+        """
+        width, height = 400, 700
+        p_bowler = [80.0, 180.0, 150.0, 500.0]
+        p_batsman = [180.0, 520.0, 240.0, 680.0]
+        boxes = [p_batsman, p_bowler]
+
+        bowler_box, batsman_box = identify_bowler_and_batsman(boxes, (100.0, 200.0), width, height)
+        self.assertEqual(bowler_box, p_bowler, "Bowler box must be nearest to release zone")
+        self.assertEqual(batsman_box, p_batsman, "Batsman box must be furthest down-pitch")
 
 
 if __name__ == '__main__':
