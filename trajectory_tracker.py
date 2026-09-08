@@ -307,7 +307,7 @@ def pass_b_refine_window(cap, model, c_start, c_end, fps, conf_thresh=0.15):
             raw_detections.append(best)
 
     if len(raw_detections) < 3:
-        return []
+        return [], False
 
     # Filter stationary noise
     moving_detections = []
@@ -325,7 +325,7 @@ def pass_b_refine_window(cap, model, c_start, c_end, fps, conf_thresh=0.15):
             moving_detections.append(det)
 
     if len(moving_detections) < 3:
-        return []
+        return [], False
 
     # Group into delivery clusters: cricket ball flight is 0.4s-1.0s.
     # Adaptive gap threshold scaling with actual fps to avoid truncating indoor nets footage
@@ -432,10 +432,18 @@ def segment_deliveries(video_path, model=None, conf_thresh=0.15, task_id='sessio
                                   f"Pass B: Refining release/impact boundaries for shot {idx} of {total_coarse}...")
             except Exception:
                 pass
-        res, had_rejected = pass_b_refine_window(cap, model, cs, ce, fps, conf_thresh=conf_thresh)
+        out = pass_b_refine_window(cap, model, cs, ce, fps, conf_thresh=conf_thresh)
+        if isinstance(out, (list, tuple)) and len(out) == 2:
+            res, had_rejected = out
+        elif isinstance(out, (list, tuple)) and len(out) == 1:
+            res, had_rejected = out[0], False
+        else:
+            res, had_rejected = out, False
+
         if had_rejected:
             any_rejected = True
-        for r in res:
+
+        for r in (res or []):
             all_refined.append(r)
 
     cap.release()

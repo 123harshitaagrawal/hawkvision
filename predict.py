@@ -21,7 +21,7 @@ def main():
                         help="Enable Bezier smoothing for past trajectory")
     parser.add_argument("--persistent", action="store_true", default=True,
                         help="Draw persistent full delivery trajectory ribbon (default: True)")
-    parser.add_argument("--trim", dest="auto_trim", action="store_true", default=True,
+    parser.add_argument("--trim", "--auto-trim", dest="auto_trim", action="store_true", default=True,
                         help="Auto-trim video to the active delivery window (default: True)")
     parser.add_argument("--no-trim", dest="auto_trim", action="store_false",
                         help="Disable auto-trim and process entire video")
