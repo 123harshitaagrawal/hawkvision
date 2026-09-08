@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HawkVision | Trajectory Session Archive</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600;700&family=Manrope:wght@400;600;700;800&display=swap"
+        rel="stylesheet">
+    <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32x32.png">
+    <link rel="stylesheet" href="/static/style.css?v=20260907_shotwise">
+</head>
+
+<body>
+    <!-- Top Navigation Bar (Identical to HawkVision Studio) -->
+    <header class="navbar">
+        <div class="nav-brand">
+            <a href="https://www.acubeai.com/" target="_blank" rel="noopener" class="brand-link" title="Visit Acube AI">
+                <img src="/static/acube_logo_dark.png" alt="Acube AI" class="brand-logo theme-dark-logo" id="brandLogoDark">
+                <img src="/static/acube_logo_light.png" alt="Acube AI" class="brand-logo theme-light-logo" id="brandLogoLight">
+            </a>
+            <div class="brand-divider"></div>
+            <div class="brand-product">
+                <span class="brand-product-name">HAWK<span class="highlight">VISION</span></span>
+                <span class="brand-product-sub">AI Cricket Ball Trajectory Analytics</span>
+            </div>
+        </div>
+        <div class="nav-meta">
+            <!-- Link to Main Prediction Lab -->
+            <a href="/" class="nav-history-link" title="Return to Trajectory Prediction Lab">
+                <span>🏏</span> Prediction Lab
+            </a>
+            <!-- Light/Dark Mode Toggle Switch -->
+            <button type="button" class="theme-toggle-btn" id="themeToggleBtn" onclick="toggleTheme()" title="Switch Light/Dark Mode" aria-label="Toggle theme">
+                <span class="theme-toggle-pill">
+                    <span class="theme-icon sun-icon">☀️</span>
+                    <span class="theme-icon moon-icon">🌙</span>
+                    <span class="theme-toggle-slider"></span>
+                </span>
+                <span class="theme-toggle-label" id="themeToggleText">Dark</span>
+            </button>
+            <div class="badge badge-tech">YOLOv8 + OpenCV</div>
+            <div class="badge badge-status"><span class="status-dot"></span> System Ready</div>
+        </div>
+    </header>
+
+    <!-- Main History Layout -->
+    <main class="history-page-wrapper">
+
+        <!-- History Hero / Header Card -->
+        <div class="history-hero-card">
+            <div class="history-hero-header">
+                <div class="history-hero-title-group">
+                    <h2>
+                        <span>📜</span> Trajectory Session Archive
+                    </h2>
+                    <p>
+                        Persistent catalog of analyzed deliveries with full ball tracking telemetry, pitch bounce records, and Gemini coaching insights.
+                    </p>
+                </div>
+                <div class="history-hero-stats">
+                    <span class="badge badge-tech" id="totalBadge">{{ sessions | length }} Saved Deliveries</span>
+                    <span class="badge badge-status"><span class="status-dot"></span> Realtime Indexed</span>
+                </div>
+            </div>
+
+            <!-- Controls Toolbar: Search & Filter Categories -->
+            <div class="history-controls-bar">
+                <div class="history-search-container">
+                    <span class="history-search-icon">🔍</span>
+                    <input type="text" id="searchInput" class="history-search-input"
+                        placeholder="Search by video, date, speed (e.g. test1, 140 km/h)..."
+                        oninput="searchSessions(this.value)">
+                    <button id="searchClearBtn" class="history-search-clear hidden" onclick="clearSearch()">✕</button>
+                </div>
+
+                <!-- Category Filter Pills -->
+                <div class="history-filter-pills">
+                    <button class="pill-btn active" id="tab-all" onclick="filterCategory('all')">
+                        All ({{ sessions | length }})
+                    </button>
+                    <button class="pill-btn" id="tab-fast" onclick="filterCategory('fast')">
+                        ⚡ Fast Pace (>120 km/h)
+                    </button>
+                    <button class="pill-btn" id="tab-bounces" onclick="filterCategory('bounces')">
+                        🏏 Bounced
+                    </button>
+                    <button class="pill-btn" id="tab-ai" onclick="filterCategory('ai')">
+                        🤖 AI Insights
+                    </button>
+                </div>
+
+                <!-- Global Action Buttons -->
+                <div class="history-actions-row">
+                    <a href="/" class="btn-small btn-primary btn-glow" style="text-decoration: none;">
+                        + New Prediction
+                    </a>
+                    <button onclick="confirmClearHistory()" class="btn-small btn-danger-outline">
+                        🗑️ Clear Index
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        {% if not sessions %}
+        <!-- Empty State -->
+        <div class="history-empty-card" id="emptyStateBox">
+            <div class="history-empty-icon">📁</div>
+            <h3>No Trajectory Sessions Found</h3>
+            <p>
+                Run a cricket ball trajectory prediction from the lab to generate and automatically catalog your delivery telemetry here.
+            </p>
+            <a href="/" class="btn btn-primary btn-glow" style="text-decoration: none; margin-top: 0.5rem;">
+                <span class="btn-icon">⚡</span> Analyze First Delivery
+            </a>
+        </div>
+        {% else %}
+
+        <!-- Sessions Stack -->
+        <div class="sessions-stack" id="session-list">
+            {% for s in sessions %}
+            <div id="card-{{ s.job_id }}"
+                 class="session-card"
+                 data-mode="{{ 'fast' if (s.release_speed_kmh >= 120 or s.avg_speed_kmh >= 120) else 'normal' }}"
+                 data-bounces="{{ 'true' if s.bounce_count > 0 else 'false' }}"
+                 data-ai="{{ 'true' if s.has_insights else 'false' }}"
+                 data-search="{{ (s.input_filename ~ ' ' ~ s.created_at ~ ' ' ~ s.release_speed_kmh ~ ' ' ~ s.avg_speed_kmh ~ ' ' ~ s.job_id) | lower }}">
+
+                <!-- Left: Video Thumbnail Box -->
+                <div class="session-thumb-box">
+                    {% if s.video_filename %}
+                    <video class="session-thumb-video"
+                           src="/videos/processed/{{ s.video_filename }}"
+                           preload="metadata"
+                           muted
+                           playsinline
+                           onmouseover="this.play().catch(function(){})"
+                           onmouseout="this.pause(); this.currentTime = 0;"></video>
+                    {% else %}
+                    <span style="font-size: 2.2rem;">🏏</span>
+                    {% endif %}
+
+                    <!-- Speed / Mode Pill -->
+                    <span class="session-speed-pill">
+                        {% if s.release_speed_kmh > 0 %}⚡ {{ s.release_speed_kmh }} km/h{% else %}🎯 {{ s.mode }}{% endif %}
+                    </span>
+                </div>
+
+                <!-- Center: Delivery Details & Score Bar -->
+                <div class="session-details-box">
+                    <!-- Top Meta Line -->
+                    <div class="session-meta-row">
+                        <span class="session-date">{{ s.created_at }}</span>
+                        <span>&bull;</span>
+                        <span class="session-filename" title="{{ s.input_filename }}">{{ s.input_filename }}</span>
+                        {% if s.duration_sec %}
+                        <span>&bull;</span>
+                        <span>{{ s.duration_sec }}s clip</span>
+                        {% endif %}
+                        {% if s.fps %}
+                        <span>&bull;</span>
+                        <span>{{ s.fps }} FPS</span>
+                        {% endif %}
+                        {% if s.total_shots and s.total_shots > 1 %}
+                        <span>&bull;</span>
+                        <span class="badge badge-trim" style="font-size:0.68rem; padding: 0.15rem 0.45rem;">✂️ {{ s.total_shots }} Deliveries</span>
+                        {% endif %}
+                        {% if s.has_insights %}
+                        <span>&bull;</span>
+                        <span class="session-insights-badge">🤖 AI Insights</span>
+                        {% endif %}
+                    </div>
+
+                    <!-- Tracking Clarity Progress Bar -->
+                    <div class="session-score-container">
+                        <div class="session-score-track">
+                            <div class="session-score-fill {% if s.score_pct >= 70 %}emerald{% elif s.score_pct >= 40 %}amber{% else %}rose{% endif %}"
+                                 style="width: {{ s.score_pct }}%;"></div>
+                        </div>
+                        <span class="session-score-label">
+                            {{ s.score_pct }}% Tracked ({{ s.detected_frames }}/{{ s.total_frames }} frames)
+                        </span>
+                    </div>
+
+                    <!-- Bottom Telemetry Chips Row -->
+                    <div class="session-telemetry-row">
+                        <span>Release: <strong>{{ s.release_speed_kmh or '--' }} km/h</strong></span>
+                        <span>Avg: <strong>{{ s.avg_speed_kmh or '--' }} km/h</strong></span>
+                        <span>Peak: <strong>{{ s.max_speed_kmh or '--' }} km/h</strong></span>
+                        <span>Deflection Bounces: <strong>{{ s.bounce_count }}</strong></span>
+                        <span>ID: <code style="color: var(--text-dim);">#{{ s.job_id }}</code></span>
+                    </div>
+                </div>
+
+                <!-- Right: Action Buttons Column -->
+                <div class="session-actions-box">
+                    <a href="/?load={{ s.job_id }}" class="btn btn-primary btn-glow" style="text-decoration: none; text-align: center; padding: 0.55rem 0.85rem; font-size: 0.8rem; font-weight: 800;">
+                        ⚡ Inspect Run ➔
+                    </a>
+                    <div class="session-sub-actions">
+                        <a href="/videos/processed/{{ s.output_filename }}" download class="btn-small btn-secondary" title="Download Processed Video">
+                            📥 Video
+                        </a>
+                        <button type="button" onclick="deleteSession('{{ s.job_id }}')" title="Delete this delivery record" class="btn-danger-icon">
+                            🗑️
+                        </button>
+                    </div>
+                </div>
+
+            </div>
+            {% endfor %}
+        </div>
+        {% endif %}
+
+    </main>
+
+    <script>
+        // Theme Management (Synchronized with HawkVision Studio)
+        function applyTheme(theme) {
+            document.documentElement.setAttribute('data-theme', theme);
+            try {
+                localStorage.setItem('hawkvision_theme', theme);
+            } catch (e) {}
+
+            const toggleBtn = document.getElementById('themeToggleBtn');
+            const toggleText = document.getElementById('themeToggleText');
+            if (toggleBtn && toggleText) {
+                if (theme === 'light') {
+                    toggleBtn.classList.add('is-light');
+                    toggleText.innerText = 'Light';
+                    toggleBtn.setAttribute('title', 'Switch to Dark Mode');
+                } else {
+                    toggleBtn.classList.remove('is-light');
+                    toggleText.innerText = 'Dark';
+                    toggleBtn.setAttribute('title', 'Switch to Light Mode');
+                }
+            }
+        }
+
+        function toggleTheme() {
+            const current = document.documentElement.getAttribute('data-theme') || 'dark';
+            applyTheme(current === 'dark' ? 'light' : 'dark');
+        }
+
+        function initTheme() {
+            let saved = 'dark';
+            try {
+                saved = localStorage.getItem('hawkvision_theme') || 'dark';
+            } catch (e) {}
+            applyTheme(saved);
+        }
+
+        let currentCategory = 'all';
+
+        function filterCategory(cat) {
+            currentCategory = cat;
+            document.querySelectorAll('.history-filter-pills .pill-btn').forEach(btn => {
+                btn.classList.remove('active');
+            });
+            const activeBtn = document.getElementById('tab-' + cat);
+            if (activeBtn) activeBtn.classList.add('active');
+
+            applyFilters();
+        }
+
+        function searchSessions(query) {
+            const clearBtn = document.getElementById('searchClearBtn');
+            if (clearBtn) {
+                if (query) clearBtn.classList.remove('hidden');
+                else clearBtn.classList.add('hidden');
+            }
+            applyFilters();
+        }
+
+        function clearSearch() {
+            const input = document.getElementById('searchInput');
+            if (input) input.value = '';
+            searchSessions('');
+        }
+
+        function applyFilters() {
+            const query = (document.getElementById('searchInput')?.value || '').toLowerCase().trim();
+            const cards = document.querySelectorAll('.session-card');
+            let visibleCount = 0;
+
+            cards.forEach(c => {
+                let matchesCat = true;
+                if (currentCategory === 'fast') {
+                    matchesCat = c.dataset.mode === 'fast';
+                } else if (currentCategory === 'bounces') {
+                    matchesCat = c.dataset.bounces === 'true';
+                } else if (currentCategory === 'ai') {
+                    matchesCat = c.dataset.ai === 'true';
+                }
+
+                const matchesQuery = !query || c.dataset.search.includes(query);
+
+                if (matchesCat && matchesQuery) {
+                    c.style.display = 'flex';
+                    visibleCount++;
+                } else {
+                    c.style.display = 'none';
+                }
+            });
+
+            const badge = document.getElementById('totalBadge');
+            if (badge) {
+                badge.innerText = `${visibleCount} Visible Deliveries`;
+            }
+        }
+
+        function deleteSession(jobId) {
+            if (!confirm('Are you sure you want to delete this delivery session? This will remove the telemetry and output video.')) {
+                return;
+            }
+
+            fetch('/delete/' + jobId + '?delete_files=true', {
+                method: 'POST'
+            })
+            .then(res => res.json())
+            .then(data => {
+                if (data.status === 'ok' || data.success) {
+                    const card = document.getElementById('card-' + jobId);
+                    if (card) {
+                        card.style.opacity = '0';
+                        card.style.transform = 'scale(0.95)';
+                        card.style.transition = 'all 0.25s ease';
+                        setTimeout(() => {
+                            card.remove();
+                            const remaining = document.querySelectorAll('.session-card').length;
+                            if (remaining === 0) location.reload();
+                            else applyFilters();
+                        }, 260);
+                    } else {
+                        location.reload();
+                    }
+                } else {
+                    alert('Could not delete delivery: ' + (data.error || 'Unknown error'));
+                }
+            })
+            .catch(err => {
+                alert('Error connecting to server.');
+            });
+        }
+
+        function confirmClearHistory() {
+            if (!confirm('Clear all processed delivery history records? (Video files will remain on disk)')) return;
+            fetch('/api/history/clear', { method: 'POST' })
+            .then(res => res.json())
+            .then(data => {
+                if (data.success) {
+                    location.reload();
+                }
+            })
+            .catch(e => alert('Error clearing history: ' + e.message));
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            initTheme();
+        });
+    </script>
+</body>
+
+</html>

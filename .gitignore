@@ -1,0 +1,44 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+myenv/
+venv/
+env/
+ENV/
+.env
+
+# Old YOLO Training Runs (keep train5 fine-tuned weights)
+runs/detect/train/
+runs/detect/train2/
+runs/detect/train3/
+runs/detect/train4/
+runs/detect/train5/weights/last.pt
+
+# Base Heavy Models (auto-downloaded by Ultralytics on demand)
+yolov8l.pt
+yolov8m.pt
+
+# Large / Temporary Video Files
+videos/processed/
+videos/upload_*
+videos/output_*.mp4
+videos/scratch_*.mp4
+videos/test5_*.mp4
+videos/test.mp4
+videos/scratch_*/
+videos/output_predicted/
+!videos/test1.mp4
+
+# Temporary / Scratch directories
+scratch/
+.tempmediaStorage/
+*.log
+
+# IDE & OS files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

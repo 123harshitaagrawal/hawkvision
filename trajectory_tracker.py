@@ -1,0 +1,1406 @@
+import os
+import math
+import time
+import subprocess
+from collections import deque
+import cv2
+import numpy as np
+from ultralytics import YOLO
+from speed_tracker import CricketSpeedTracker
+
+def angle_between_lines(m1, m2=1):
+    """Calculate the angle between two lines."""
+    if m1 != -1 / m2:
+        angle = math.degrees(math.atan(abs((m2 - m1) / (1 + m1 * m2))))
+        return angle
+    else:
+        return 90.0
+
+def create_bezier_curve(points, smoothness=30):
+    """Smooth points using quadratic/cubic Bezier curve."""
+    if len(points) < 3:
+        return np.array(points, dtype=np.int32)
+    t = np.linspace(0, 1, smoothness)
+    curve = []
+    p0, p1, p2 = points[0], points[1], points[2]
+    for val in t:
+        x = (1 - val) ** 2 * p0[0] + 2 * (1 - val) * val * p1[0] + val ** 2 * p2[0]
+        y = (1 - val) ** 2 * p0[1] + 2 * (1 - val) * val * p1[1] + val ** 2 * p2[1]
+        curve.append([int(x), int(y)])
+    return np.array(curve, dtype=np.int32)
+
+def convert_to_browser_h264(input_path, output_path):
+    """
+    Convert video to browser-standard H.264 (yuv420p + faststart)
+    using imageio_ffmpeg or system ffmpeg for full browser compatibility.
+    """
+    try:
+        import imageio_ffmpeg
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        ffmpeg_exe = "ffmpeg"
+
+    cmd = [
+        ffmpeg_exe, "-y",
+        "-i", input_path,
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        "-preset", "fast",
+        "-crf", "22",
+        output_path
+    ]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        return res.returncode == 0
+    except Exception as e:
+        print(f"H.264 conversion warning: {e}")
+        return False
+
+def pass_a_coarse_windows(video_path, pre_pad_sec=0.5, post_pad_sec=0.5, progress_callback=None):
+    """
+    Pass A: Coarse candidate delivery window detector using downsampled frame differencing.
+    Fast, cheap scan across the video to find bursts of motion separated by dead time.
+    """
+    if not os.path.exists(video_path):
+        return []
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return []
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
+
+    if total_frames <= int(fps * 3.2):
+        cap.release()
+        return [(0, total_frames)]
+
+    FLOW_W, FLOW_H = 160, 90
+    prev_corridor = None
+    motion_scores = []
+    frame_idx = 0
+    phone_cutoff_frame = total_frames
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame_idx += 1
+        small = cv2.resize(frame, (FLOW_W, FLOW_H))
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        corridor = gray[int(FLOW_H * 0.12):int(FLOW_H * 0.92), int(FLOW_W * 0.12):int(FLOW_W * 0.88)]
+
+        if prev_corridor is not None:
+            diff = float(np.mean(cv2.absdiff(corridor, prev_corridor)))
+            if frame_idx > total_frames * 0.75 and diff > 14.0 and phone_cutoff_frame == total_frames:
+                phone_cutoff_frame = max(0, frame_idx - int(fps * 0.5))
+            motion_scores.append(min(diff, 8.0))
+        else:
+            motion_scores.append(0.0)
+
+        prev_corridor = corridor
+
+        if progress_callback and (frame_idx % 30 == 0 or frame_idx >= total_frames):
+            try:
+                progress_callback(frame_idx, total_frames, 0.0, False,
+                                  "Pass A: Scanning video for candidate delivery windows...")
+            except Exception:
+                pass
+
+    cap.release()
+
+    if not motion_scores:
+        return [(0, total_frames)]
+
+    effective_end = min(total_frames, phone_cutoff_frame)
+    scores_arr = np.array(motion_scores[:effective_end], dtype=np.float32)
+
+    k_size = max(5, int(fps * 0.35))
+    if k_size % 2 == 0:
+        k_size += 1
+    smooth = np.convolve(scores_arr, np.ones(k_size) / k_size, mode='same')
+
+    p50 = float(np.percentile(smooth, 50))
+    th = max(1.5, min(p50, 2.2))
+
+    peaks = [i for i in range(1, len(smooth) - 1) if smooth[i] >= th and smooth[i] >= smooth[i - 1] and smooth[i] >= smooth[i + 1]]
+    if not peaks:
+        return [(0, total_frames)]
+
+    gap_thresh = int(fps * 0.5)
+    groups = []
+    cur_group = [peaks[0]]
+    for p in peaks[1:]:
+        if p - cur_group[-1] <= gap_thresh:
+            cur_group.append(p)
+        else:
+            groups.append((cur_group[0], cur_group[-1]))
+            cur_group = [p]
+    if cur_group:
+        groups.append((cur_group[0], cur_group[-1]))
+
+    # Connect bowler release & batsman stroke if gap <= 4.0s and combined span <= 8.5s
+    deliveries = []
+    for g in groups:
+        if not deliveries:
+            deliveries.append(g)
+        else:
+            prev_s, prev_e = deliveries[-1]
+            prev_dur = (prev_e - prev_s) / fps
+            gap_sec = (g[0] - prev_e) / fps
+            comb_sec = (g[1] - prev_s) / fps
+            if prev_dur < 3.0 and gap_sec <= 4.0 and comb_sec <= 8.5:
+                deliveries[-1] = (prev_s, g[1])
+            else:
+                deliveries.append(g)
+
+    pre_pad = int(fps * pre_pad_sec)
+    post_pad = int(fps * post_pad_sec)
+    coarse_windows = []
+    for s, e in deliveries:
+        w_s = max(0, s - pre_pad)
+        w_e = min(effective_end, e + post_pad)
+        if (w_e - w_s) >= int(fps * 1.5):
+            coarse_windows.append((w_s, w_e))
+
+    for i in range(len(coarse_windows) - 1):
+        if coarse_windows[i][1] > coarse_windows[i + 1][0]:
+            mid = (coarse_windows[i][1] + coarse_windows[i + 1][0]) // 2
+            coarse_windows[i] = (coarse_windows[i][0], mid)
+            coarse_windows[i + 1] = (mid, coarse_windows[i + 1][1])
+
+    return coarse_windows
+
+
+def fit_parabola_r2(frames, ys):
+    """Calculate R2 score for 2nd-degree polynomial fit y(t) = a*t^2 + b*t + c."""
+    if len(frames) < 3:
+        return 0.0
+    try:
+        t = np.array(frames, dtype=np.float32)
+        y = np.array(ys, dtype=np.float32)
+        p = np.polyfit(t, y, 2)
+        y_pred = np.polyval(p, t)
+        ss_res = np.sum((y - y_pred) ** 2)
+        ss_tot = np.sum((y - np.mean(y)) ** 2)
+        if ss_tot == 0:
+            return 1.0 if ss_res == 0 else 0.0
+        return max(0.0, float(1.0 - (ss_res / ss_tot)))
+    except Exception:
+        return 0.0
+
+
+def pass_b_refine_window(cap, model, c_start, c_end, fps, conf_thresh=0.15):
+    """
+    Pass B: Precise release & impact boundary refinement using YOLO ball tracking and projectile kinematics.
+    Sets start_frame = ball leaving hand (-4 safety buffer) and end_frame = pitch impact/stumps (+6 safety buffer).
+    """
+    cap.set(cv2.CAP_PROP_POS_FRAMES, c_start)
+    raw_detections = []
+
+    for f in range(c_start, c_end):
+        ret, frame = cap.read()
+        if not ret:
+            break
+        results = model.predict(frame, conf=conf_thresh, verbose=False)
+        best = None
+        if len(results) > 0 and results[0].boxes is not None:
+            for box in results[0].boxes:
+                conf = float(box.conf[0])
+                xyxy = box.xyxy[0].tolist()
+                cx = (xyxy[0] + xyxy[2]) / 2.0
+                cy = (xyxy[1] + xyxy[3]) / 2.0
+                if best is None or conf > best['conf']:
+                    best = {'frame': f, 'cx': cx, 'cy': cy, 'conf': conf, 'box': xyxy}
+        if best:
+            raw_detections.append(best)
+
+    if len(raw_detections) < 3:
+        return []
+
+    # Filter stationary noise
+    moving_detections = []
+    for i in range(len(raw_detections)):
+        det = raw_detections[i]
+        is_moving = True
+        if i > 0:
+            prev = raw_detections[i - 1]
+            dt = det['frame'] - prev['frame']
+            if 0 < dt <= 3:
+                dist = math.hypot(det['cx'] - prev['cx'], det['cy'] - prev['cy'])
+                if (dist / dt) < 1.0:
+                    is_moving = False
+        if is_moving:
+            moving_detections.append(det)
+
+    if len(moving_detections) < 3:
+        return []
+
+    # Group into delivery clusters: cricket ball flight is 0.4s-1.0s.
+    # Split deliveries if detection gap > 0.75s (~22 frames at 30 fps), preventing multi-delivery merge
+    delivery_clusters = []
+    cur_cluster = [moving_detections[0]]
+    cluster_gap_thresh = max(12, int(fps * 0.75))
+    for d in moving_detections[1:]:
+        if d['frame'] - cur_cluster[-1]['frame'] <= cluster_gap_thresh:
+            cur_cluster.append(d)
+        else:
+            if len(cur_cluster) >= 4:
+                delivery_clusters.append(cur_cluster)
+            cur_cluster = [d]
+    if len(cur_cluster) >= 4:
+        delivery_clusters.append(cur_cluster)
+
+    if not delivery_clusters:
+        return []
+
+    refined = []
+    for cluster in delivery_clusters:
+        f_list = [d['frame'] for d in cluster]
+        y_list = [d['cy'] for d in cluster]
+        conf_list = [d['conf'] for d in cluster]
+
+        r2 = fit_parabola_r2(f_list, y_list)
+
+        # Release frame: ball leaving bowler's hand
+        # Safety buffer: 4 frames before first detected airborne flight
+        first_f = f_list[0]
+        release_f = max(c_start, first_f - 4)
+
+        # Impact / end frame: ground pitch contact or stumps hit
+        # Safety buffer: 3 frames after last detected ball flight (tightened against next run-up)
+        last_f = f_list[-1]
+        impact_f = min(c_end, last_f + 3)
+
+        # Minimum duration guarantee (>= 0.9s is sufficient for full delivery flight)
+        if (impact_f - release_f) < int(fps * 0.9):
+            impact_f = min(c_end, release_f + int(fps * 0.9))
+
+        det_density = min(1.0, len(cluster) / max(1, (impact_f - release_f) * 0.55))
+        mean_conf = float(np.mean(conf_list)) if conf_list else 0.5
+        seg_conf = round(0.40 * r2 + 0.35 * det_density + 0.25 * mean_conf, 2)
+        seg_conf = max(0.45, min(0.99, seg_conf))
+
+        refined.append({
+            "start_frame": int(release_f),
+            "end_frame": int(impact_f),
+            "flight_start_frame": int(first_f),
+            "flight_end_frame": int(last_f),
+            "detected_points": len(cluster),
+            "parabola_r2": round(r2, 3),
+            "confidence": seg_conf
+        })
+
+    return refined
+
+
+def segment_deliveries(video_path, model=None, conf_thresh=0.15, task_id='session', debug=False, progress_callback=None):
+    """
+    Two-Stage Multi-Delivery Auto-Segmentation Pipeline.
+    Pass A: Coarse motion candidate windows.
+    Pass B: Precise release-to-impact boundary refinement using YOLO ball projectile kinematics.
+    Returns standardized JSON contract matching Part 1.
+    """
+    if not os.path.exists(video_path):
+        return {"task_id": task_id, "video_filename": os.path.basename(video_path), "shots": [], "shot_count": 0}
+
+    # Resolve YOLO model
+    if model is None:
+        possible_paths = [
+            os.path.join('runs', 'detect', 'train5', 'weights', 'best.pt'),
+            os.path.join('Cricket-Ball-Trajectory-Prediction-master', 'runs', 'detect', 'train5', 'weights', 'best.pt'),
+            'yolov8s.pt'
+        ]
+        m_path = next((p for p in possible_paths if os.path.exists(p)), 'yolov8s.pt')
+        model = YOLO(m_path)
+
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
+
+    # Pass A: Coarse Windows
+    coarse = pass_a_coarse_windows(video_path, progress_callback=progress_callback)
+
+    all_refined = []
+    total_coarse = len(coarse)
+    for idx, (cs, ce) in enumerate(coarse, 1):
+        if progress_callback:
+            try:
+                progress_callback(idx, total_coarse, 0.0, False,
+                                  f"Pass B: Refining release/impact boundaries for shot {idx} of {total_coarse}...")
+            except Exception:
+                pass
+        res = pass_b_refine_window(cap, model, cs, ce, fps, conf_thresh=conf_thresh)
+        for r in res:
+            all_refined.append(r)
+
+    cap.release()
+
+    # Fallback to Pass A coarse windows if Pass B returned no refined windows
+    if not all_refined and coarse:
+        for cs, ce in coarse:
+            all_refined.append({
+                "start_frame": cs,
+                "end_frame": ce,
+                "flight_start_frame": cs,
+                "flight_end_frame": ce,
+                "detected_points": 0,
+                "parabola_r2": 0.0,
+                "confidence": 0.50
+            })
+
+    # Midpoint split for overlapping refined windows
+    for i in range(len(all_refined) - 1):
+        if all_refined[i]['end_frame'] > all_refined[i + 1]['start_frame']:
+            mid = (all_refined[i]['end_frame'] + all_refined[i + 1]['start_frame']) // 2
+            all_refined[i]['end_frame'] = mid
+            all_refined[i + 1]['start_frame'] = mid
+
+    shots = []
+    for idx, r in enumerate(all_refined, 1):
+        sf = r['start_frame']
+        ef = r['end_frame']
+        shots.append({
+            "shot_id": f"{task_id}_shot_{idx}",
+            "shot_index": idx,
+            "start_frame": sf,
+            "end_frame": ef,
+            "start_time_sec": round(sf / fps, 2),
+            "end_time_sec": round(ef / fps, 2),
+            "duration_sec": round((ef - sf) / fps, 2),
+            "clip_path": f"processed/{task_id}/shot_{idx}.mp4",
+            "thumbnail_path": f"processed/{task_id}/thumb_shot_{idx}.jpg",
+            "segmentation_confidence": r.get("confidence", 0.90),
+            "parabola_r2": r.get("parabola_r2", 0.0),
+            "detected_points": r.get("detected_points", 0),
+            "status": "pending"
+        })
+
+    contract = {
+        "task_id": task_id,
+        "video_filename": os.path.basename(video_path),
+        "total_video_frames": total_frames,
+        "fps": round(fps, 2),
+        "shots": shots,
+        "shot_count": len(shots)
+    }
+
+    # Debug dump if HAWKEYE_SEGMENTATION_DEBUG or debug flag
+    if debug or os.environ.get("HAWKEYE_SEGMENTATION_DEBUG") == "1":
+        debug_path = os.path.join(os.path.dirname(video_path), "processed", f"{task_id}_segmentation_debug.json")
+        try:
+            os.makedirs(os.path.dirname(debug_path), exist_ok=True)
+            with open(debug_path, "w", encoding="utf-8") as f:
+                json.dump({"coarse_windows": coarse, "refined_shots": shots, "contract": contract}, f, indent=2)
+        except Exception:
+            pass
+
+    return contract
+
+
+def find_delivery_windows(video_path, model=None, conf_thresh=0.15, pre_pad_sec=1.2, post_pad_sec=1.4, progress_callback=None):
+    """
+    Two-stage delivery window detector.
+    Returns (delivery_windows, was_trimmed), where delivery_windows is [(start_frame, end_frame), ...].
+    """
+    contract = segment_deliveries(
+        video_path, model=model, conf_thresh=conf_thresh, 
+        task_id="auto_trim", progress_callback=progress_callback
+    )
+    shots = contract.get("shots", [])
+    if not shots:
+        return [(0, contract.get("total_video_frames", 1))], False
+
+    windows = [(s["start_frame"], s["end_frame"]) for s in shots]
+    total_frames = contract.get("total_video_frames", 1)
+    total_trimmed_len = sum(e - s for (s, e) in windows)
+
+    if len(windows) == 1 and total_trimmed_len >= total_frames * 0.92:
+        return [(0, total_frames)], False
+
+    return windows, True
+
+
+def find_delivery_window(video_path, model=None, conf_thresh=0.15, pre_pad_sec=0.5, post_pad_sec=0.8, progress_callback=None):
+    """
+    Backward-compatible single delivery window detector.
+    """
+    windows, was_trimmed = find_delivery_windows(
+        video_path, model=model, conf_thresh=conf_thresh, 
+        pre_pad_sec=pre_pad_sec, post_pad_sec=post_pad_sec, 
+        progress_callback=progress_callback
+    )
+    if windows and was_trimmed:
+        return windows[0][0], windows[0][1], True
+    elif windows:
+        return windows[0][0], windows[0][1], False
+    return 0, 1, False
+
+
+def extract_shot_clip(input_video_path, output_clip_path, start_frame, end_frame):
+    """Extract a precise slice of frames from input video to browser-standard H.264 mp4."""
+    os.makedirs(os.path.dirname(os.path.abspath(output_clip_path)), exist_ok=True)
+    cap = cv2.VideoCapture(input_video_path)
+    if not cap.isOpened():
+        return False
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    temp_raw = output_clip_path + ".raw.mp4"
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(temp_raw, fourcc, fps, (w, h))
+
+    for f in range(start_frame, end_frame):
+        ret, frame = cap.read()
+        if not ret:
+            break
+        out.write(frame)
+
+    cap.release()
+    out.release()
+
+    success = convert_to_browser_h264(temp_raw, output_clip_path)
+    if success and os.path.exists(output_clip_path):
+        try:
+            os.remove(temp_raw)
+        except Exception:
+            pass
+        return True
+    elif os.path.exists(temp_raw):
+        if os.path.exists(output_clip_path):
+            try:
+                os.remove(output_clip_path)
+            except Exception:
+                pass
+        os.rename(temp_raw, output_clip_path)
+        return True
+    return False
+
+
+def capture_shot_thumbnail(input_video_path, output_thumb_path, target_frame):
+    """Capture a single representative frame as a high-quality JPEG thumbnail."""
+    os.makedirs(os.path.dirname(os.path.abspath(output_thumb_path)), exist_ok=True)
+    cap = cv2.VideoCapture(input_video_path)
+    if not cap.isOpened():
+        return False
+    cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(target_frame)))
+    ret, frame = cap.read()
+    cap.release()
+    if ret and frame is not None:
+        cv2.imwrite(output_thumb_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        return True
+    return False
+
+
+class KalmanBallTracker:
+    """
+    2D Kalman Filter for tracking a cricket ball in pixel space with constant velocity & gravity.
+    State vector: [x, y, vx, vy]
+    Measurement vector: [x, y]
+    """
+    def __init__(self, init_x, init_y, dt=1.0, gravity=0.5):
+        self.dt = dt
+        self.gravity = gravity
+        # State: [x, y, vx, vy]
+        self.x = np.array([init_x, init_y, 0.0, 0.0], dtype=np.float64)
+        
+        # State transition matrix
+        self.F = np.array([
+            [1.0, 0.0, dt,  0.0],
+            [0.0, 1.0, 0.0, dt ],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0]
+        ], dtype=np.float64)
+        
+        # Measurement matrix
+        self.H = np.array([
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0]
+        ], dtype=np.float64)
+        
+        # Covariance matrices
+        self.P = np.eye(4, dtype=np.float64) * 100.0
+        self.Q = np.array([
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 4.0, 0.0],
+            [0.0, 0.0, 0.0, 4.0]
+        ], dtype=np.float64)
+        self.R = np.eye(2, dtype=np.float64) * 5.0
+
+    def predict(self):
+        """Predict the next state."""
+        self.x = self.F @ self.x
+        # Add slight gravity acceleration to vertical position/velocity
+        self.x[1] += 0.5 * self.gravity * (self.dt ** 2)
+        self.x[3] += self.gravity * self.dt
+        self.P = self.F @ self.P @ self.F.T + self.Q
+        return float(self.x[0]), float(self.x[1])
+
+    def update(self, z_x, z_y):
+        """Update filter state with verified detection measurement."""
+        z = np.array([z_x, z_y], dtype=np.float64)
+        y = z - (self.H @ self.x)
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+        self.x = self.x + K @ y
+        I = np.eye(4, dtype=np.float64)
+        self.P = (I - K @ self.H) @ self.P
+        return float(self.x[0]), float(self.x[1])
+
+    def get_pos(self):
+        return int(round(self.x[0])), int(round(self.x[1]))
+
+    def get_velocity(self):
+        return float(self.x[2]), float(self.x[3])
+
+    def reflect_bounce(self, restitution=0.55):
+        """Reflect vertical velocity upon pitch bounce with restitution damping."""
+        self.x[3] = -abs(self.x[3]) * restitution
+        self.P[3, 3] = max(self.P[3, 3], 36.0)
+
+
+class CricketTrajectoryPredictor:
+    def __init__(self, model_path=None, conf_thresh=0.20, history_len=20, pred_steps=8, device=None):
+        if model_path is None:
+            possible_paths = [
+                os.path.join('runs', 'detect', 'train5', 'weights', 'best.pt'),
+                os.path.join('Cricket-Ball-Trajectory-Prediction-master', 'runs', 'detect', 'train5', 'weights', 'best.pt'),
+                os.path.join('..', 'runs', 'detect', 'train5', 'weights', 'best.pt'),
+                'yolov8s.pt'
+            ]
+            for p in possible_paths:
+                if os.path.exists(p):
+                    model_path = p
+                    break
+            if model_path is None:
+                model_path = 'yolov8s.pt'
+        
+        self.model_path = model_path
+        self.device = device
+        self.model = YOLO(model_path)
+        if device is not None:
+            try:
+                self.model.to(device)
+            except Exception:
+                pass
+        self.conf_thresh = conf_thresh
+        self.history_len = history_len
+        self.pred_steps = pred_steps
+
+    def draw_glowing_path(self, frame, points, color_bgr=(0, 230, 255), core_color=(255, 255, 255), 
+                          use_bezier=True, show_nodes=True):
+        """Draw a high-visibility Hawkeye glowing path with nodes."""
+        if len(points) < 2:
+            return
+
+        pts = np.array(points, dtype=np.int32)
+        
+        # Smooth with Bezier if requested and sufficient points
+        if use_bezier and len(points) >= 4:
+            smooth_pts = []
+            for i in range(0, len(points) - 2, 2):
+                sub = [points[i], points[i+1], points[i+2]]
+                bez = create_bezier_curve(sub, smoothness=15)
+                smooth_pts.extend(bez.tolist())
+            if len(smooth_pts) > 0:
+                pts = np.array(smooth_pts, dtype=np.int32)
+
+        # Glow layer (thick semi-transparent)
+        glow_layer = frame.copy()
+        cv2.polylines(glow_layer, [pts], isClosed=False, color=color_bgr, thickness=6, lineType=cv2.LINE_AA)
+        cv2.addWeighted(glow_layer, 0.45, frame, 0.55, 0, frame)
+
+        # Crisp inner core line
+        cv2.polylines(frame, [pts], isClosed=False, color=color_bgr, thickness=3, lineType=cv2.LINE_AA)
+        cv2.polylines(frame, [pts], isClosed=False, color=core_color, thickness=1, lineType=cv2.LINE_AA)
+
+        # Node markers on original verified points
+        if show_nodes:
+            for pt in points:
+                cv2.circle(frame, (int(pt[0]), int(pt[1])), radius=3, color=color_bgr, thickness=-1, lineType=cv2.LINE_AA)
+                cv2.circle(frame, (int(pt[0]), int(pt[1])), radius=1, color=core_color, thickness=-1, lineType=cv2.LINE_AA)
+
+    def draw_reticle_box(self, frame, x1, y1, x2, y2, label="Ball", color=(0, 220, 255)):
+        """Draw modern corner-bracket bounding box with label."""
+        cx = int((x1 + x2) / 2)
+        cy = int((y1 + y2) / 2)
+        w = max(int(x2 - x1), 10)
+        h = max(int(y2 - y1), 10)
+        line_len = max(int(min(w, h) * 0.35), 4)
+
+        # Center target dot
+        cv2.circle(frame, (cx, cy), radius=2, color=(0, 0, 255), thickness=-1, lineType=cv2.LINE_AA)
+        cv2.circle(frame, (cx, cy), radius=5, color=color, thickness=1, lineType=cv2.LINE_AA)
+
+        # Corner brackets
+        # Top-Left
+        cv2.line(frame, (x1, y1), (x1 + line_len, y1), color, 2, cv2.LINE_AA)
+        cv2.line(frame, (x1, y1), (x1, y1 + line_len), color, 2, cv2.LINE_AA)
+        # Top-Right
+        cv2.line(frame, (x2, y1), (x2 - line_len, y1), color, 2, cv2.LINE_AA)
+        cv2.line(frame, (x2, y1), (x2, y1 + line_len), color, 2, cv2.LINE_AA)
+        # Bottom-Left
+        cv2.line(frame, (x1, y2), (x1 + line_len, y2), color, 2, cv2.LINE_AA)
+        cv2.line(frame, (x1, y2), (x1, y2 - line_len), color, 2, cv2.LINE_AA)
+        # Bottom-Right
+        cv2.line(frame, (x2, y2), (x2 - line_len, y2), color, 2, cv2.LINE_AA)
+        cv2.line(frame, (x2, y2), (x2, y2 - line_len), color, 2, cv2.LINE_AA)
+
+        # Tag pill
+        text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)[0]
+        ty = max(y1 - 6, 18)
+        cv2.rectangle(frame, (x1, ty - text_size[1] - 3), (x1 + text_size[0] + 6, ty + 3), (20, 25, 35), -1)
+        cv2.rectangle(frame, (x1, ty - text_size[1] - 3), (x1 + text_size[0] + 6, ty + 3), color, 1)
+        cv2.putText(frame, label, (x1 + 3, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+
+    def process_video(self, input_video_path, output_video_path=None, show_window=False, 
+                      use_bezier=True, persistent_trail=True, auto_trim=True, task_id=None, progress_callback=None):
+        """
+        Process a video, track cricket ball trajectory with robust outlier rejection,
+        smooth Kalman momentum estimation, bounce detection, and broadcast-style annotations.
+        Optionally auto-trims to the active delivery window (release to batsman/stumps).
+        Generates full annotated video as well as isolated per-shot video clips and thumbnails.
+        """
+        if not os.path.exists(input_video_path):
+            raise FileNotFoundError(f"Video file not found: {input_video_path}")
+
+        # Resolve task_id if not explicitly provided
+        if not task_id and output_video_path:
+            base_out = os.path.basename(output_video_path)
+            task_id = base_out.replace("pred_", "").replace(".mp4", "")
+        if not task_id:
+            task_id = "delivery"
+
+        cap = cv2.VideoCapture(input_video_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"Failed to open video: {input_video_path}")
+
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
+
+        # Initial progress notification
+        if progress_callback:
+            try:
+                progress_callback(0, total_frames, 0.0, False, "Auto-detecting delivery action window...")
+            except TypeError:
+                try:
+                    progress_callback(0, total_frames, 0.0, False)
+                except Exception:
+                    pass
+
+        # Multi-Delivery Auto-trim detection
+        start_frame = 0
+        end_frame = total_frames
+        was_trimmed = False
+
+        if auto_trim:
+            windows, was_trimmed = find_delivery_windows(
+                input_video_path, self.model, 
+                conf_thresh=self.conf_thresh, 
+                progress_callback=progress_callback
+            )
+            if was_trimmed and windows:
+                delivery_windows = windows
+            else:
+                delivery_windows = [(0, total_frames)]
+                was_trimmed = False
+        else:
+            delivery_windows = [(0, total_frames)]
+            was_trimmed = False
+
+        effective_total_frames = max(1, sum(w[1] - w[0] for w in delivery_windows))
+        total_shots = len(delivery_windows)
+
+        out = None
+        temp_raw_path = None
+        task_shots_dir = None
+        if output_video_path:
+            os.makedirs(os.path.dirname(os.path.abspath(output_video_path)), exist_ok=True)
+            temp_raw_path = output_video_path + ".raw.mp4"
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(temp_raw_path, fourcc, fps, (width, height))
+            task_shots_dir = os.path.join(os.path.dirname(os.path.abspath(output_video_path)), task_id)
+            os.makedirs(task_shots_dir, exist_ok=True)
+
+        # Tracking state
+        kalman = None
+        missed_frames = 0
+        max_missed_frames = 5  # Bridge gaps up to 5 frames
+        max_jump_dist = max(width, height) * 0.25  # Max plausible ball speed per frame
+
+        # --- Physics Validator State ---
+        # Minimum confidence for any detection to be considered (raises bar against 53% wristband hits)
+        MIN_CONF_DISCOVERY = 0.55        # Needed to START tracking a new ball (no Kalman yet)
+        MIN_CONF_TRACKING  = 0.35        # Needed to UPDATE an established Kalman track
+        # Once Kalman is established, only accept detections within this pixel radius of prediction
+        KALMAN_GATE_RADIUS  = max(width, height) * 0.12   # Tight gate: ~12% of frame
+        KALMAN_STRICT_RADIUS = max(width, height) * 0.06  # Ultra-tight if conf < 0.60
+        # A real ball must be MOVING – min displacement across last N frames (pixels)
+        MIN_VELOCITY_TO_CONFIRM = 5.0   # px/frame – gloves are nearly stationary
+        # Stability buffer: require 2 consecutive quality detections before starting Kalman
+        pending_candidate = None        # (cx, cy, conf) of tentative first detection
+        pending_candidate_count = 0
+
+        # Trajectory stores
+        full_trajectory = []     # All tracked (x, y) across current delivery shot
+        active_trail = deque(maxlen=self.history_len)
+        bounce_events = []
+        speed_tracker = CricketSpeedTracker(fps=fps, frame_width=width, frame_height=height)
+        current_speed_kmh = 0.0
+        current_speed_mph = 0.0
+        
+        telemetry = {
+            "total_frames": effective_total_frames,
+            "original_total_frames": total_frames,
+            "fps": fps,
+            "width": width,
+            "height": height,
+            "detected_frames": 0,
+            "bounce_events": [],
+            "speed_summary": None,
+            "trajectory_points": [],
+            "frame_data": [],
+            "total_shots": total_shots,
+            "shots_data": [],
+            "trim_info": {
+                "trimmed": was_trimmed,
+                "total_shots": total_shots,
+                "shots": [
+                    {
+                        "shot": idx + 1,
+                        "start_frame": w[0],
+                        "end_frame": w[1],
+                        "start_sec": round(w[0] / fps, 2),
+                        "end_sec": round(w[1] / fps, 2),
+                        "duration_sec": round((w[1] - w[0]) / fps, 2)
+                    } for idx, w in enumerate(delivery_windows)
+                ],
+                "start_frame": delivery_windows[0][0],
+                "end_frame": delivery_windows[-1][1],
+                "start_sec": round(delivery_windows[0][0] / fps, 2),
+                "end_sec": round(delivery_windows[-1][1] / fps, 2),
+                "duration_sec": round(effective_total_frames / fps, 2),
+                "saved_time_sec": round((total_frames - effective_total_frames) / fps, 2)
+            }
+        }
+
+        processed_frames = 0
+        prev_time = time.time()
+        user_stopped = False
+        shots_data = []
+
+        for shot_idx, (w_start, w_end) in enumerate(delivery_windows):
+            if user_stopped:
+                break
+
+            shot_num = shot_idx + 1
+            shot_raw_temp = None
+            shot_clip_final = None
+            shot_thumb_final = None
+            shot_writer = None
+            best_thumb_frame = None
+
+            if task_shots_dir:
+                shot_raw_temp = os.path.join(task_shots_dir, f"shot_{shot_num}.raw.mp4")
+                shot_clip_final = os.path.join(task_shots_dir, f"shot_{shot_num}.mp4")
+                shot_thumb_final = os.path.join(task_shots_dir, f"thumb_shot_{shot_num}.jpg")
+                fourcc_shot = cv2.VideoWriter_fourcc(*'mp4v')
+                shot_writer = cv2.VideoWriter(shot_raw_temp, fourcc_shot, fps, (width, height))
+
+            # -----------------------------------------------------------------
+            # Per-Shot State Reset:
+            # Whenever a new shot plays, wipe old trajectory ribbon, active trail,
+            # Kalman momentum, and previous bounce rings.
+            # -----------------------------------------------------------------
+            kalman = None
+            missed_frames = 0
+            pending_candidate = None
+            pending_candidate_count = 0
+            shot_detected_frames = 0
+            shot_angles = []
+            full_trajectory.clear()
+            active_trail.clear()
+            bounce_events.clear()
+            speed_tracker.reset_delivery()
+            current_speed_kmh = 0.0
+            current_speed_mph = 0.0
+            last_angle = 0.0
+            consecutive_bounces = 0
+            last_vy = 0.0
+
+            # Two-Phase Modeling & Outlier Rejection State
+            current_phase = 1          # Phase 1: Pre-bounce (release -> bounce). Phase 2: Post-bounce (bounce -> stumps)
+            phase_1_points = []
+            phase_2_points = []
+            bounce_point = None
+            stump_hit_point = None
+            is_stump_hit = False
+            post_bounce_boost_frames = 0
+            tracking_stopped_for_shot = False
+            consecutive_slow_frames = 0
+            bowler_release_zone = None
+
+            # Seek video directly to the start of this delivery window
+            shot_video_start_frame = processed_frames
+            cap.set(cv2.CAP_PROP_POS_FRAMES, w_start)
+            frame_idx = w_start
+
+            while cap.isOpened() and frame_idx < w_end:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                frame_idx += 1
+                t_now = time.time()
+                instant_fps = 1.0 / max(t_now - prev_time, 1e-5)
+                prev_time = t_now
+
+                # 1. Predict with Kalman filter if active
+                predicted_pos = None
+                if kalman is not None and not tracking_stopped_for_shot:
+                    predicted_pos = kalman.predict()
+
+                # 2. Run YOLO Object Detection
+                results = self.model.predict(frame, conf=max(self.conf_thresh * 0.7, 0.12), verbose=False)
+                boxes = results[0].boxes if len(results) > 0 else None
+
+                # 3. Filter Candidates & Select True Cricket Ball (Physics Validator)
+                best_candidate = None
+                highest_score = -1.0
+                candidate_is_bounce_rebound = False
+
+                if not tracking_stopped_for_shot and boxes is not None and len(boxes) > 0:
+                    box_data = boxes.xyxy.cpu().numpy()
+                    confs = boxes.conf.cpu().numpy() if hasattr(boxes, 'conf') else [1.0] * len(box_data)
+
+                    for i in range(len(box_data)):
+                        x1, y1, x2, y2 = box_data[i]
+                        conf = float(confs[i])
+
+                        # --- Gate 1: Shape / Aspect ratio (Cricket ball is roughly 1:1) ---
+                        bw = max(x2 - x1, 1)
+                        bh = max(y2 - y1, 1)
+                        aspect = float(bw) / float(bh)
+                        if aspect < 0.35 or aspect > 2.8:
+                            continue  # Bats, limbs, long shadows
+                        circularity = 1.0 - abs(1.0 - aspect)  # 1.0 = perfect square
+
+                        cx = (x1 + x2) / 2.0
+                        cy = (y1 + y2) / 2.0
+
+                        # --- Continuity & Outlier Rejection (Bug A Fix) ---
+                        # Once track has >= 6 points and moved down the pitch:
+                        if len(full_trajectory) >= 6:
+                            last_pt = full_trajectory[-1]
+                            if last_pt[1] > height * 0.35:
+                                # Candidate jumping > 70 px backwards up the pitch towards bowler
+                                if (cy - last_pt[1]) < -70:
+                                    continue
+                                # Candidate near bowler release zone while current ball is far down pitch
+                                if bowler_release_zone is not None:
+                                    dist_to_bowler = math.hypot(cx - bowler_release_zone[0], cy - bowler_release_zone[1])
+                                    dist_curr_to_bowler = math.hypot(last_pt[0] - bowler_release_zone[0], last_pt[1] - bowler_release_zone[1])
+                                    if dist_to_bowler < 65 and dist_curr_to_bowler > 120:
+                                        tracking_stopped_for_shot = True
+                                        break
+
+                        # --- Gate 2: Spatial Proximity & Confidence (Bug B Fix) ---
+                        is_rebound_cand = False
+                        if kalman is not None and predicted_pos is not None:
+                            pred_x, pred_y = predicted_pos
+                            dist = math.hypot(cx - pred_x, cy - pred_y)
+
+                            # Check if candidate matches a reflected bounce trajectory
+                            effective_dist = dist
+                            if current_phase == 1 and len(full_trajectory) >= 3 and pred_y > height * 0.30:
+                                vy_est = kalman.x[3]
+                                if vy_est > 0.8:
+                                    bounce_y_pred = pred_y - 1.55 * vy_est * kalman.dt
+                                    dist_reflected = math.hypot(cx - pred_x, cy - bounce_y_pred)
+                                    if dist_reflected < dist and dist_reflected < KALMAN_GATE_RADIUS * 1.8 and cy <= pred_y + 8:
+                                        effective_dist = dist_reflected
+                                        is_rebound_cand = True
+
+                            base_gate = KALMAN_GATE_RADIUS * 2.2 if post_bounce_boost_frames > 0 else KALMAN_GATE_RADIUS
+                            strict_gate = KALMAN_GATE_RADIUS * 1.5 if post_bounce_boost_frames > 0 else KALMAN_STRICT_RADIUS
+                            effective_gate = base_gate if conf >= 0.50 else strict_gate
+
+                            if effective_dist > effective_gate:
+                                continue
+
+                            min_conf = 0.18 if (post_bounce_boost_frames > 0 or is_rebound_cand) else MIN_CONF_TRACKING
+                            if conf < min_conf:
+                                continue
+
+                            proximity_weight = math.exp(- (effective_dist ** 2) / (2 * (50.0 ** 2)))
+                            score = (conf * 0.45) + (proximity_weight * 0.45) + (circularity * 0.10)
+                        else:
+                            disc_conf = 0.25 if post_bounce_boost_frames > 0 else MIN_CONF_DISCOVERY
+                            if conf < disc_conf:
+                                continue
+                            score = (conf * 0.75) + (circularity * 0.25)
+
+                        if score > highest_score:
+                            highest_score = score
+                            best_candidate = (int(x1), int(y1), int(x2), int(y2), cx, cy, conf)
+                            candidate_is_bounce_rebound = is_rebound_cand
+
+                # 4. State Update with Stability Buffer (Physics Validator)
+                ball_detected = False
+                current_centroid = None
+                current_bbox = None
+                is_estimated = False
+                display_conf = 0.0
+
+                if best_candidate is not None:
+                    x1, y1, x2, y2, cx, cy, conf = best_candidate
+
+                    # If candidate matches a pitch bounce rebound, reflect Kalman
+                    if candidate_is_bounce_rebound and kalman is not None and kalman.x[3] > 0:
+                        kalman.reflect_bounce(restitution=0.55)
+                        current_phase = 2
+                        post_bounce_boost_frames = 8
+                        if bounce_point is None and len(full_trajectory) > 0:
+                            bounce_point = full_trajectory[-1]
+                            b_info = {
+                                "shot": shot_idx + 1,
+                                "frame": frame_idx,
+                                "timestamp": round(frame_idx / fps, 2),
+                                "angle": round(last_angle, 1),
+                                "speed_kmh": current_speed_kmh,
+                                "speed_mph": current_speed_mph,
+                                "position": list(bounce_point)
+                            }
+                            bounce_events.append(b_info)
+                            telemetry["bounce_events"].append(b_info)
+                            speed_tracker.record_bounce(frame_idx)
+
+                    if kalman is not None:
+                        kx, ky = kalman.update(cx, cy)
+                        vx_k, vy_k = kalman.get_velocity()
+                        speed = math.hypot(vx_k, vy_k)
+                        track_len = len(full_trajectory)
+                        if track_len > 4 and speed < MIN_VELOCITY_TO_CONFIRM and conf < 0.70 and current_phase == 1:
+                            pass
+                        else:
+                            ball_detected = True
+                            display_conf = conf
+                            current_bbox = [x1, y1, x2, y2]
+                            current_centroid = (int(kx), int(ky))
+                            missed_frames = 0
+                            pending_candidate = None
+                            pending_candidate_count = 0
+                            telemetry["detected_frames"] += 1
+                            shot_detected_frames += 1
+                            if bowler_release_zone is None:
+                                bowler_release_zone = current_centroid
+
+                    else:
+                        if pending_candidate is not None:
+                            px, py, pc = pending_candidate
+                            inter_dist = math.hypot(cx - px, cy - py)
+                            if inter_dist >= MIN_VELOCITY_TO_CONFIRM and inter_dist < max_jump_dist:
+                                kalman = KalmanBallTracker(cx, cy, dt=1.0, gravity=0.4)
+                                ball_detected = True
+                                display_conf = conf
+                                current_bbox = [x1, y1, x2, y2]
+                                current_centroid = (int(cx), int(cy))
+                                missed_frames = 0
+                                pending_candidate = None
+                                pending_candidate_count = 0
+                                telemetry["detected_frames"] += 1
+                                shot_detected_frames += 1
+                                if bowler_release_zone is None:
+                                    bowler_release_zone = current_centroid
+                            else:
+                                pending_candidate = (cx, cy, conf)
+                                pending_candidate_count = 1
+                        else:
+                            pending_candidate = (cx, cy, conf)
+                            pending_candidate_count = 1
+
+                else:
+                    pending_candidate = None
+                    pending_candidate_count = 0
+
+                # Kalman momentum bridge for missed frames
+                if not ball_detected and not is_estimated and not tracking_stopped_for_shot:
+                    if kalman is not None and missed_frames < max_missed_frames:
+                        missed_frames += 1
+                        is_estimated = True
+                        # If in Phase 1 and missed right around the bounce area:
+                        if current_phase == 1 and len(full_trajectory) >= 3 and kalman.x[1] > height * 0.40 and kalman.x[3] > 0:
+                            kalman.reflect_bounce(restitution=0.55)
+                            current_phase = 2
+                            post_bounce_boost_frames = 8
+                            if bounce_point is None and len(full_trajectory) > 0:
+                                bounce_point = full_trajectory[-1]
+                                b_info = {
+                                    "shot": shot_idx + 1,
+                                    "frame": frame_idx,
+                                    "timestamp": round(frame_idx / fps, 2),
+                                    "angle": round(last_angle, 1),
+                                    "speed_kmh": current_speed_kmh,
+                                    "speed_mph": current_speed_mph,
+                                    "position": list(bounce_point)
+                                }
+                                bounce_events.append(b_info)
+                                telemetry["bounce_events"].append(b_info)
+                                speed_tracker.record_bounce(frame_idx)
+
+                        kx, ky = kalman.get_pos()
+                        if 0 <= kx < width and 0 <= ky < height:
+                            current_centroid = (kx, ky)
+                            box_rad = 12
+                            current_bbox = [max(0, kx - box_rad), max(0, ky - box_rad),
+                                            min(width - 1, kx + box_rad), min(height - 1, ky + box_rad)]
+                        else:
+                            kalman = None
+                            tracking_stopped_for_shot = True
+                    elif kalman is not None:
+                        kalman = None
+                        missed_frames = 0
+
+                # 5. Append Trajectory Point & Velocity Calculations
+                if post_bounce_boost_frames > 0:
+                    post_bounce_boost_frames -= 1
+
+                if current_centroid is not None and not tracking_stopped_for_shot:
+                    full_trajectory.append(current_centroid)
+                    active_trail.append(current_centroid)
+                    current_speed_kmh, current_speed_mph = speed_tracker.update(
+                        frame_idx, current_centroid, is_estimated=is_estimated
+                    )
+
+                    # Manage Phase 1 and Phase 2 trajectory lists
+                    if current_phase == 1:
+                        phase_1_points.append(current_centroid)
+                    else:
+                        if bounce_point and (len(phase_2_points) == 0 or phase_2_points[0] != bounce_point):
+                            phase_2_points.insert(0, bounce_point)
+                        phase_2_points.append(current_centroid)
+
+                    # Phase 2 termination check (ground stop or stumps hit)
+                    if current_phase == 2 and len(phase_2_points) >= 3:
+                        p_last = phase_2_points[-1]
+                        p_prev = phase_2_points[-2]
+                        disp = math.hypot(p_last[0] - p_prev[0], p_last[1] - p_prev[1])
+                        if disp < 2.2:
+                            consecutive_slow_frames += 1
+                        else:
+                            consecutive_slow_frames = 0
+
+                        if consecutive_slow_frames >= 4:
+                            tracking_stopped_for_shot = True
+                            if not stump_hit_point and p_last[1] > height * 0.40:
+                                is_stump_hit = True
+                                stump_hit_point = p_last
+
+                # 6. Motion Angle, Future Projection & Bounce Detection
+                future_positions = []
+                is_bounce = False
+
+                if len(active_trail) >= 2:
+                    pts = list(active_trail)
+                    x_diff = pts[-1][0] - pts[-2][0]
+                    y_diff = pts[-1][1] - pts[-2][1]
+
+                    if x_diff != 0:
+                        m1 = y_diff / x_diff
+                        if m1 == 1:
+                            angle = 90.0
+                        elif m1 != 0:
+                            angle = 90.0 - angle_between_lines(m1)
+                        else:
+                            angle = 0.0
+                        last_angle = angle
+                        shot_angles.append(last_angle)
+
+                    if len(pts) >= 3:
+                        prev_ydiff = pts[-2][1] - pts[-3][1]
+                        # Rebound: was falling downwards (prev_ydiff > 1.5), now rebounding upward/flattening
+                        is_rebound = ((prev_ydiff > 1.5 and y_diff <= 0) or (prev_ydiff > 3.0 and y_diff < prev_ydiff * 0.25)) and pts[-1][1] > height * 0.30
+                        if is_rebound and current_phase == 1:
+                            consecutive_bounces += 1
+                            if consecutive_bounces == 1:
+                                is_bounce = True
+                                current_phase = 2
+                                post_bounce_boost_frames = 8
+                                if kalman is not None and kalman.x[3] > 0:
+                                    kalman.reflect_bounce(restitution=0.55)
+                                bounce_pt = (pts[-2][0], pts[-2][1]) if y_diff < 0 else (pts[-1][0], pts[-1][1])
+                                if bounce_point is None:
+                                    bounce_point = bounce_pt
+                                    if phase_1_points and phase_1_points[-1] != bounce_point:
+                                        phase_1_points.append(bounce_point)
+                                    if not phase_2_points:
+                                        phase_2_points.append(bounce_point)
+                                speed_tracker.record_bounce(frame_idx)
+                                b_info = {
+                                    "shot": shot_idx + 1,
+                                    "frame": frame_idx,
+                                    "timestamp": round(frame_idx / fps, 2),
+                                    "angle": round(last_angle, 1),
+                                    "speed_kmh": current_speed_kmh,
+                                    "speed_mph": current_speed_mph,
+                                    "position": list(bounce_point) if bounce_point else [pts[-1][0], pts[-1][1]]
+                                }
+                                bounce_events.append(b_info)
+                                telemetry["bounce_events"].append(b_info)
+                        else:
+                            consecutive_bounces = 0
+
+                    vx = x_diff
+                    vy = y_diff
+                    fx, fy = float(pts[-1][0]), float(pts[-1][1])
+                    future_positions.append((int(fx), int(fy)))
+
+                    for step in range(1, self.pred_steps + 1):
+                        fx += vx
+                        fy += vy + (0.4 * step)
+                        if 0 <= fx < width and 0 <= fy < height:
+                            future_positions.append((int(fx), int(fy)))
+                        else:
+                            break
+
+                # 7. Render Broadcast Annotations: Two-Phase Trajectory
+                # Phase 1 (Pre-bounce flight): Amber / Gold
+                if len(phase_1_points) >= 2:
+                    self.draw_glowing_path(frame, phase_1_points, color_bgr=(0, 180, 255), 
+                                           core_color=(255, 255, 255), use_bezier=use_bezier, show_nodes=True)
+                elif not phase_2_points and len(full_trajectory) >= 2:
+                    self.draw_glowing_path(frame, full_trajectory, color_bgr=(0, 180, 255), 
+                                           core_color=(255, 255, 255), use_bezier=use_bezier, show_nodes=True)
+
+                # Phase 2 (Post-bounce flight to stumps): Cyan / Electric Emerald
+                if len(phase_2_points) >= 2:
+                    self.draw_glowing_path(frame, phase_2_points, color_bgr=(255, 220, 0), 
+                                           core_color=(255, 255, 255), use_bezier=use_bezier, show_nodes=True)
+
+                for b in bounce_events:
+                    bx, by = b["position"]
+                    cv2.circle(frame, (bx, by), radius=14, color=(0, 140, 255), thickness=2, lineType=cv2.LINE_AA)
+                    cv2.circle(frame, (bx, by), radius=7, color=(0, 230, 255), thickness=-1, lineType=cv2.LINE_AA)
+                    cv2.circle(frame, (bx, by), radius=2, color=(255, 255, 255), thickness=-1, lineType=cv2.LINE_AA)
+                    cv2.putText(frame, f"PITCH {b['angle']:.0f}°", (bx + 12, by + 4), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 230, 255), 1, cv2.LINE_AA)
+
+                if stump_hit_point is not None:
+                    sx, sy = stump_hit_point
+                    cv2.circle(frame, (sx, sy), radius=16, color=(0, 50, 255), thickness=2, lineType=cv2.LINE_AA)
+                    cv2.circle(frame, (sx, sy), radius=8, color=(0, 180, 255), thickness=-1, lineType=cv2.LINE_AA)
+                    cv2.circle(frame, (sx, sy), radius=3, color=(255, 255, 255), thickness=-1, lineType=cv2.LINE_AA)
+                    cv2.putText(frame, "WICKET HIT", (sx + 14, sy + 4), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 80, 255), 2, cv2.LINE_AA)
+
+                if len(future_positions) >= 2:
+                    for i in range(1, len(future_positions)):
+                        cv2.line(frame, future_positions[i - 1], future_positions[i], (0, 255, 128), 2, cv2.LINE_AA)
+                        cv2.circle(frame, future_positions[i], radius=3, color=(0, 255, 200), thickness=-1, lineType=cv2.LINE_AA)
+
+                if current_bbox is not None and current_centroid is not None:
+                    x1, y1, x2, y2 = current_bbox
+                    tag = f"Ball {display_conf*100:.0f}%" if not is_estimated else "Track (EST)"
+                    tag_color = (0, 220, 255) if not is_estimated else (0, 165, 255)
+                    self.draw_reticle_box(frame, x1, y1, x2, y2, label=tag, color=tag_color)
+
+                hud_bg = frame.copy()
+                hud_w = 340
+                hud_h = 76
+                cv2.rectangle(hud_bg, (12, 12), (hud_w, hud_h), (15, 18, 26), -1)
+                cv2.addWeighted(hud_bg, 0.78, frame, 0.22, 0, frame)
+                cv2.rectangle(frame, (12, 12), (hud_w, hud_h), (55, 70, 95), 1)
+
+                processed_frames += 1
+
+                shot_str = f"[SHOT {shot_idx + 1}/{total_shots}] " if total_shots > 1 else ""
+                speed_val_str = f"{current_speed_kmh:.1f} km/h | {current_speed_mph:.1f} mph" if current_speed_kmh > 0 else "-- km/h"
+                speed_str = f"{shot_str}SPEED: {speed_val_str}"
+                speed_color = (0, 255, 128) if current_speed_kmh > 0 else (160, 160, 160)
+                cv2.putText(frame, speed_str, (22, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.44 if total_shots > 1 else 0.48, speed_color, 2, cv2.LINE_AA)
+
+                if len(bounce_events) > 0:
+                    angle_str = f"BOUNCE ANGLE: {bounce_events[-1]['angle']:.1f}°"
+                else:
+                    angle_str = f"ANGLE: {last_angle:.1f}°"
+                cv2.putText(frame, angle_str, (22, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 220, 255), 2, cv2.LINE_AA)
+
+                if is_bounce or consecutive_bounces > 0:
+                    cv2.rectangle(frame, (width - 240, 15), (width - 15, 55), (0, 80, 255), -1)
+                    cv2.putText(frame, "! PITCH BOUNCE !", (width - 225, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 2, cv2.LINE_AA)
+
+                # Capture candidate thumbnail frame
+                if is_bounce or best_thumb_frame is None or (ball_detected and display_conf > 0.65):
+                    best_thumb_frame = frame.copy()
+
+                frame_entry = {
+                    "shot": shot_idx + 1,
+                    "frame": frame_idx,
+                    "relative_frame": processed_frames,
+                    "phase": current_phase,
+                    "detected": ball_detected,
+                    "is_estimated": is_estimated,
+                    "centroid": current_centroid,
+                    "bbox": current_bbox,
+                    "speed_kmh": current_speed_kmh,
+                    "speed_mph": current_speed_mph,
+                    "angle": round(last_angle, 2),
+                    "is_bounce": is_bounce,
+                    "is_stump_hit": is_stump_hit,
+                    "predicted_points": future_positions
+                }
+                telemetry["frame_data"].append(frame_entry)
+                if current_centroid:
+                    telemetry["trajectory_points"].append({
+                        "shot": shot_idx + 1,
+                        "frame": frame_idx,
+                        "relative_frame": processed_frames,
+                        "phase": current_phase,
+                        "x": current_centroid[0],
+                        "y": current_centroid[1],
+                        "is_estimated": is_estimated,
+                        "is_bounce": is_bounce,
+                        "is_stump_hit": is_stump_hit
+                    })
+
+                # Write to full combined video and individual shot video
+                if out is not None:
+                    out.write(frame)
+                if shot_writer is not None:
+                    shot_writer.write(frame)
+
+                # Live preview window if requested
+                if show_window:
+                    resized = cv2.resize(frame, (1000, 600))
+                    cv2.imshow("Cricket Ball Trajectory Prediction", resized)
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord('q'):
+                        user_stopped = True
+                        break
+                    elif key == ord(' '):
+                        while True:
+                            k = cv2.waitKey(30) & 0xFF
+                            if k == ord('q'):
+                                user_stopped = True
+                                break
+                            elif k == ord(' '):
+                                break
+
+                if progress_callback:
+                    step_msg = f"Tracking delivery {shot_idx + 1} of {total_shots}..." if total_shots > 1 else "Tracking ball trajectory & kinematics..."
+                    try:
+                        progress_callback(processed_frames, effective_total_frames, last_angle, ball_detected or is_estimated, step_msg)
+                    except TypeError:
+                        try:
+                            progress_callback(processed_frames, effective_total_frames, last_angle, ball_detected or is_estimated)
+                        except Exception:
+                            pass
+
+            shot_video_end_frame = processed_frames
+            shot_video_start_sec = round(shot_video_start_frame / fps, 2)
+            shot_video_end_sec = round(shot_video_end_frame / fps, 2)
+
+            # Finalize per-shot video clip
+            if shot_writer is not None:
+                shot_writer.release()
+                if os.path.exists(shot_raw_temp):
+                    success = convert_to_browser_h264(shot_raw_temp, shot_clip_final)
+                    if success and os.path.exists(shot_clip_final):
+                        try:
+                            os.remove(shot_raw_temp)
+                        except Exception:
+                            pass
+                    else:
+                        if os.path.exists(shot_clip_final):
+                            try:
+                                os.remove(shot_clip_final)
+                            except Exception:
+                                pass
+                        os.rename(shot_raw_temp, shot_clip_final)
+
+            # Save per-shot thumbnail
+            if best_thumb_frame is not None and shot_thumb_final:
+                try:
+                    cv2.imwrite(shot_thumb_final, best_thumb_frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                except Exception:
+                    pass
+
+            # Record per-shot kinematics summary
+            curr_shot_speed = speed_tracker.get_summary(include_history=False)
+            shot_total_frames = max(1, w_end - w_start)
+            shot_info = {
+                "shot_id": f"{task_id}_shot_{shot_num}",
+                "shot_index": shot_num,
+                "shot": shot_num,
+                "start_frame": w_start,
+                "end_frame": w_end,
+                "start_sec": round(w_start / fps, 2),
+                "end_sec": round(w_end / fps, 2),
+                "video_start_frame": shot_video_start_frame,
+                "video_end_frame": shot_video_end_frame,
+                "video_start_sec": shot_video_start_sec,
+                "video_end_sec": shot_video_end_sec,
+                "duration_sec": round((w_end - w_start) / fps, 2),
+                "total_frames": shot_total_frames,
+                "detected_frames": shot_detected_frames,
+                "tracking_rate": round((shot_detected_frames / shot_total_frames) * 100, 1),
+                "release_speed_kmh": curr_shot_speed.get("release_speed_kmh", 0) or 0.0,
+                "release_speed_mph": curr_shot_speed.get("release_speed_mph", 0) or 0.0,
+                "avg_speed_kmh": curr_shot_speed.get("avg_speed_kmh", 0) or 0.0,
+                "avg_speed_mph": curr_shot_speed.get("avg_speed_mph", 0) or 0.0,
+                "max_speed_kmh": curr_shot_speed.get("max_speed_kmh", 0) or 0.0,
+                "max_speed_mph": curr_shot_speed.get("max_speed_mph", 0) or 0.0,
+                "bounces": list(bounce_events),
+                "bounce_count": len(bounce_events),
+                "avg_angle": round(sum(shot_angles) / len(shot_angles), 1) if shot_angles else 0.0,
+                "phase_1_trajectory": list(phase_1_points),
+                "phase_2_trajectory": list(phase_2_points),
+                "bounce_point": list(bounce_point) if bounce_point else None,
+                "stump_hit_point": list(stump_hit_point) if stump_hit_point else None,
+                "is_stump_hit": is_stump_hit,
+                "clip_path": f"processed/{task_id}/shot_{shot_num}.mp4" if task_shots_dir else "",
+                "thumbnail_path": f"processed/{task_id}/thumb_shot_{shot_num}.jpg" if task_shots_dir else "",
+                "video_url": f"/videos/processed/{task_id}/shot_{shot_num}.mp4" if task_shots_dir else "",
+                "thumbnail_url": f"/videos/processed/{task_id}/thumb_shot_{shot_num}.jpg" if task_shots_dir else "",
+                "status": "processed"
+            }
+            shots_data.append(shot_info)
+
+        cap.release()
+        if out is not None:
+            out.release()
+            if temp_raw_path and os.path.exists(temp_raw_path):
+                success = convert_to_browser_h264(temp_raw_path, output_video_path)
+                if success and os.path.exists(output_video_path):
+                    try:
+                        os.remove(temp_raw_path)
+                    except Exception:
+                        pass
+                else:
+                    if os.path.exists(output_video_path):
+                        try:
+                            os.remove(output_video_path)
+                        except Exception:
+                            pass
+                    os.rename(temp_raw_path, output_video_path)
+
+        if show_window:
+            cv2.destroyAllWindows()
+
+        telemetry["task_id"] = task_id
+        telemetry["shots"] = shots_data
+        telemetry["shots_data"] = shots_data
+        telemetry["shot_count"] = len(shots_data)
+        telemetry["speed_summary"] = speed_tracker.get_summary()
+        telemetry["trajectory"] = {
+            "pre_bounce": [p for p in telemetry["trajectory_points"] if p.get("phase") == 1],
+            "post_bounce": [p for p in telemetry["trajectory_points"] if p.get("phase") == 2],
+            "bounce_point": telemetry["bounce_events"][0]["position"] if telemetry["bounce_events"] else None,
+            "stump_hit": [s["stump_hit_point"] for s in shots_data if s.get("stump_hit_point")] or None
+        }
+        return telemetry

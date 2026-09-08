@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HawkVision | Cricket Ball Trajectory Prediction & Analytics</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Manrope:wght@400;600;700;800&display=swap"
+        rel="stylesheet">
+    <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32x32.png">
+    <link rel="stylesheet" href="/static/style.css?v=20260907_shot_replay_speed">
+</head>
+
+<body>
+    <!-- Top Navigation Bar -->
+    <header class="navbar">
+        <div class="nav-brand">
+            <a href="https://www.acubeai.com/" target="_blank" rel="noopener" class="brand-link" title="Visit Acube AI">
+                <img src="/static/acube_logo_dark.png" alt="Acube AI" class="brand-logo theme-dark-logo" id="brandLogoDark">
+                <img src="/static/acube_logo_light.png" alt="Acube AI" class="brand-logo theme-light-logo" id="brandLogoLight">
+            </a>
+            <div class="brand-divider"></div>
+            <div class="brand-product">
+                <span class="brand-product-name">HAWK<span class="highlight">VISION</span></span>
+                <span class="brand-product-sub">AI Cricket Ball Trajectory Analytics</span>
+            </div>
+        </div>
+        <div class="nav-meta">
+            <!-- Session History Page Link -->
+            <a href="/history" class="nav-history-link" title="Open Session History Archive">
+                <span>📜</span> History <span class="badge badge-tech" id="topNavHistoryCount" style="padding: 0.15rem 0.45rem; font-size: 0.7rem; margin-left: 2px;">0</span>
+            </a>
+            <!-- Light/Dark Mode Toggle Switch -->
+            <button type="button" class="theme-toggle-btn" id="themeToggleBtn" onclick="toggleTheme()" title="Switch Light/Dark Mode" aria-label="Toggle theme">
+                <span class="theme-toggle-pill">
+                    <span class="theme-icon sun-icon">☀️</span>
+                    <span class="theme-icon moon-icon">🌙</span>
+                    <span class="theme-toggle-slider"></span>
+                </span>
+                <span class="theme-toggle-label" id="themeToggleText">Dark</span>
+            </button>
+            <div class="badge badge-tech">YOLOv8 + OpenCV</div>
+            <div class="badge badge-status"><span class="status-dot"></span> System Ready</div>
+        </div>
+    </header>
+
+    <main class="main-container">
+        <!-- Sidebar Configuration Controls -->
+        <aside class="sidebar">
+            <div class="panel-header">
+                <h3>🏏 HawkVision</h3>
+                <p>AI Cricket Ball Trajectory Analysis</p>
+            </div>
+
+            <form id="predictForm">
+                <!-- Video Selection Source -->
+                <div class="form-group">
+                    <label class="form-label">Video Source</label>
+                    <div class="tab-switch">
+                        <button type="button" class="tab-btn active" id="tabPreset"
+                            onclick="switchVideoTab('preset')">Preset Clips</button>
+                        <button type="button" class="tab-btn" id="tabUpload" onclick="switchVideoTab('upload')">Upload
+                            MP4</button>
+                    </div>
+                </div>
+
+                <!-- Preset Video Selector -->
+                <div class="form-group" id="presetSection">
+                    <label class="form-label" for="presetSelect">Select Video</label>
+                    <select id="presetSelect" class="form-control">
+                        <option value="test1.mp4" selected>test1.mp4 (Bowler Delivery)</option>
+                        <option value="test.mp4">test.mp4 (Match Clip)</option>
+                    </select>
+                </div>
+
+                <!-- Custom Upload Section -->
+                <div class="form-group hidden" id="uploadSection">
+                    <label class="form-label">Upload Video File</label>
+                    <div class="drop-zone" id="dropZone" onclick="document.getElementById('fileInput').click()">
+                        <div class="drop-icon">📹</div>
+                        <div class="drop-text">Click or drag & drop video here</div>
+                        <div class="drop-hint">MP4, AVI, MOV up to 100MB</div>
+                        <input type="file" id="fileInput" accept="video/mp4,video/avi,video/quicktime" class="hidden"
+                            onchange="handleFileSelected(event)">
+                    </div>
+                    <div id="fileSelectedInfo" class="file-info hidden"></div>
+                </div>
+
+                <!-- Hidden defaults (always use optimal settings) -->
+                <input type="hidden" id="modelSelect" value="runs/detect/train5/weights/best.pt">
+                <input type="hidden" id="confSlider" value="0.25">
+                <input type="hidden" id="historySlider" value="15">
+                <input type="hidden" id="futureSlider" value="6">
+                <input type="hidden" id="autoTrimToggle" value="true">
+                <input type="hidden" id="bezierToggle" value="true">
+
+
+                <!-- Submit Button -->
+                <button type="button" id="startBtn" class="btn btn-primary btn-glow" onclick="startAnalysis()">
+                    <span class="btn-icon">⚡</span> Run Trajectory Prediction
+                </button>
+            </form>
+        </aside>
+
+        <!-- Main Analytics Workspace -->
+        <section class="workspace">
+            <!-- Processing Progress Overlay/Banner -->
+            <div id="progressBanner" class="progress-card hidden">
+                <div class="progress-header">
+                    <div class="progress-title">
+                        <div class="spinner"></div>
+                        <span id="progressStep">Detecting & Predicting Ball Trajectory...</span>
+                    </div>
+                    <div class="progress-percent" id="progressPercent">0%</div>
+                </div>
+                <div class="progress-bar-container">
+                    <div class="progress-bar-fill" id="progressBar" style="width: 0%"></div>
+                </div>
+                <div class="progress-telemetry">
+                    <span>Frame: <strong id="progFrame">0 / 0</strong></span>
+                    <span>Status: <strong id="progStatus">Searching...</strong></span>
+                    <span>Current Angle: <strong id="progAngle">0.0°</strong></span>
+                </div>
+            </div>
+
+            <!-- Multi-Shot Grid Dashboard Section (shown when multiple shots detected) -->
+            <div id="shotsDashboardSection" class="shots-dashboard-section hidden">
+                <div class="card dashboard-banner">
+                    <div class="dashboard-banner-content">
+                        <div class="dashboard-header-row">
+                            <div class="dashboard-header-left">
+                                <div class="dashboard-badge-row">
+                                    <span class="badge badge-tech">AUTO-SEGMENTED SPELL</span>
+                                    <span class="badge badge-trim" id="dashSpellBadge">3 Deliveries</span>
+                                </div>
+                                <h2 class="dashboard-title">🏏 Bowling Spell Deliveries Dashboard</h2>
+                                <p class="dashboard-subtitle" id="dashSpellSummary">
+                                    Segmented deliveries with independent kinematics, pitch trajectory mapping, and Gemini performance verdicts.
+                                </p>
+                            </div>
+                            <div class="dashboard-header-right">
+                                <button type="button" class="ctrl-pill-btn btn-replay-all" onclick="replayFullVideo()" title="Watch continuous combined video">
+                                    <span class="ctrl-icon">▶️</span>
+                                    <span>Watch Full Continuous Video</span>
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Grid of Shot Cards -->
+                <div class="shots-grid" id="shotsGridContainer">
+                    <!-- Dynamically rendered shot cards -->
+                </div>
+            </div>
+
+            <!-- Dedicated Shot Detail Section (contains video, stats, pitch map, and insights) -->
+            <div id="shotDetailSection" class="shot-detail-section">
+                <!-- Navigation Bar with Back Button when in multi-shot mode -->
+                <div id="shotDetailNav" class="shot-detail-nav hidden">
+                    <button type="button" class="btn-back-shots" onclick="backToShotsDashboard()">
+                        <span class="back-icon">←</span>
+                        <span>Back to All Deliveries</span>
+                    </button>
+                    <div class="shot-breadcrumb" id="shotBreadcrumb">
+                        <span class="breadcrumb-root">All Deliveries</span>
+                        <span class="breadcrumb-sep">/</span>
+                        <span class="breadcrumb-current" id="breadcrumbShotTitle">Shot 1 Detail</span>
+                    </div>
+                    <div class="shot-quick-switch" id="shotQuickSwitch">
+                        <!-- Quick switch buttons between shots -->
+                    </div>
+                </div>
+
+                <!-- Video Player Display Container -->
+                <div class="card video-card">
+                <div class="card-header">
+                    <div class="card-title">
+                        <span class="indicator-live"></span>
+                        <span>Trajectory Video Analysis</span>
+                        <span id="trimBadge" class="badge badge-trim hidden">✂️ Trimmed: 0.0s - 0.0s</span>
+                    </div>
+                    <div class="video-actions">
+                        <a id="downloadVideoBtn" href="#" download class="btn-small btn-secondary disabled">
+                            📥 Download Video
+                        </a>
+                    </div>
+                </div>
+                <div class="video-container" id="videoWrapper">
+                    <video id="resultVideo" controls playsinline class="annotated-video"
+                        poster="/images/sample_output_frame_16.jpg">
+                        <source id="videoSource" src="/videos/output_test1.mp4" type="video/mp4">
+                        Your browser does not support HTML5 video.
+                    </video>
+                    <div id="videoHudToast" class="video-hud-toast hidden"></div>
+                </div>
+                <!-- Interactive Playback Toolbar -->
+                <div class="video-playback-bar" id="videoPlaybackBar">
+                    <div class="playback-bar-left">
+                        <button type="button" class="ctrl-pill-btn btn-replay-all" onclick="replayFullVideo()" title="Replay entire video from beginning">
+                            <span class="ctrl-icon">⏮️</span>
+                            <span>Replay Full Video</span>
+                        </button>
+                        <button type="button" class="ctrl-pill-btn btn-replay-shot" id="replayCurrentShotBtn" onclick="replayActiveShot()" title="Replay currently selected shot">
+                            <span class="ctrl-icon">▶️</span>
+                            <span id="replayShotBtnText">Replay Shot 1</span>
+                        </button>
+                        <button type="button" class="ctrl-pill-btn btn-loop-shot" id="loopShotToggleBtn" onclick="toggleShotLoop()" title="Toggle looping of current shot">
+                            <span class="ctrl-icon">🔁</span>
+                            <span id="loopShotBtnText">Loop: Off</span>
+                        </button>
+                    </div>
+                    <div class="playback-bar-right">
+                        <div class="speed-control-wrap">
+                            <span class="speed-title-text">⚡ Speed:</span>
+                            <div class="speed-btn-group" id="speedBtnGroup">
+                                <button type="button" class="speed-btn" data-speed="0.25" onclick="setVideoSpeed(0.25)" title="Quarter Speed (0.25x Super Slow-Mo)">0.25x</button>
+                                <button type="button" class="speed-btn" data-speed="0.5" onclick="setVideoSpeed(0.5)" title="Half Speed (0.5x Slow Motion)">0.5x</button>
+                                <button type="button" class="speed-btn active" data-speed="1.0" onclick="setVideoSpeed(1.0)" title="Normal Speed (1x)">1x</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Analytics Overview Cards -->
+            <div class="stats-grid">
+                <div class="stat-card stat-speed">
+                    <div class="stat-icon">⚡</div>
+                    <div class="stat-info">
+                        <div class="stat-label">Ball Speed (Release)</div>
+                        <div class="stat-value" id="statSpeedMain">-- km/h</div>
+                        <div class="stat-sub" id="statSpeedSub">Avg: -- | Peak: --</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">🎯</div>
+                    <div class="stat-info">
+                        <div class="stat-label">Ball Tracked Rate</div>
+                        <div class="stat-value" id="statTrackedRate">26.5%</div>
+                        <div class="stat-sub" id="statTrackedFrames">22 of 83 frames</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">📐</div>
+                    <div class="stat-info">
+                        <div class="stat-label">Ball Trajectory Angle</div>
+                        <div class="stat-value" id="statAvgAngle">8.1°</div>
+                        <div class="stat-sub">Angle to pitch axis</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">🏏</div>
+                    <div class="stat-info">
+                        <div class="stat-label">Pitch Bounce Events</div>
+                        <div class="stat-value" id="statBounces">0</div>
+                        <div class="stat-sub">Deflection detected</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">🔮</div>
+                    <div class="stat-info">
+                        <div class="stat-label">Prediction Horizon</div>
+                        <div class="stat-value" id="statHorizon">6 Steps</div>
+                        <div class="stat-sub">Forward projection</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Bottom Tabs: 2D Pitch View & Telemetry Data -->
+            <div class="card tabs-card">
+                <div class="card-header">
+                    <div class="tab-pills">
+                        <button class="pill-btn active" id="tabPitchBtn" onclick="switchAnalyticsTab('pitch')">🏏 2D Pitch Coordinate Map</button>
+                        <button class="pill-btn" id="tabTelemetryBtn" onclick="switchAnalyticsTab('telemetry')">📊 Frame Telemetry Table</button>
+                        <button class="pill-btn" id="tabBouncesBtn" onclick="switchAnalyticsTab('bounces')">💥 Bounce Events Log</button>
+                    </div>
+                    <div class="export-actions">
+                        <button class="btn-small btn-secondary" onclick="exportTelemetryJSON()">Export JSON</button>
+                        <button class="btn-small btn-secondary" onclick="exportTelemetryCSV()">Export CSV</button>
+                    </div>
+                </div>
+
+                <!-- Tab 1: 2D Pitch Canvas -->
+                <div id="tabPitch" class="tab-pane active">
+                    <!-- Shot Switcher for 2D Pitch Map -->
+                    <div id="pitchShotSelectorBar" class="pitch-shot-bar hidden"></div>
+                    <div class="pitch-canvas-wrapper">
+                        <canvas id="pitchCanvas" width="800" height="320"></canvas>
+                        <div class="pitch-legend">
+                            <span class="legend-item"><span class="dot dot-blue"></span> Past Tracked Trajectory</span>
+                            <span class="legend-item"><span class="dot dot-green"></span> Predicted Future
+                                Trajectory</span>
+                            <span class="legend-item"><span class="dot dot-red"></span> Current Ball Centroid</span>
+                            <span class="legend-item"><span class="dot dot-orange"></span> Pitch Stumps & Crease</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Tab 2: Telemetry Data Table -->
+                <div id="tabTelemetry" class="tab-pane hidden">
+                    <div class="table-responsive">
+                        <table class="telemetry-table">
+                            <thead>
+                                <tr>
+                                    <th>Frame</th>
+                                    <th>Timestamp</th>
+                                    <th>Ball Detected</th>
+                                    <th>Centroid (X, Y)</th>
+                                    <th>Speed (km/h)</th>
+                                    <th>Speed (mph)</th>
+                                    <th>Bounding Box [X1, Y1, X2, Y2]</th>
+                                    <th>Angle (deg)</th>
+                                    <th>Event</th>
+                                </tr>
+                            </thead>
+                            <tbody id="telemetryTableBody">
+                                <tr>
+                                    <td colspan="9" class="text-center">Run prediction to view frame telemetry</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Tab 3: Bounce Log -->
+                <div id="tabBounces" class="tab-pane hidden">
+                    <div id="bounceLogContent" class="bounce-log">
+                        <div class="empty-state">No bounce events detected or analysis not yet run.</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- AI Insights Card -->
+            <div class="card ai-insights-card" id="aiInsightsCard">
+                <div class="card-header">
+                    <div class="card-title">
+                        <span class="ai-icon">🤖</span>
+                        <span>AI Coaching Insights</span>
+                        <span class="badge badge-tech" style="font-size:0.65rem; padding: 0.2rem 0.55rem;">Powered by
+                            Gemini</span>
+                    </div>
+                    <button id="analyzeBtn" class="btn-small btn-ai" onclick="runAIAnalysis()" disabled>
+                        ✨ Get AI Insights
+                    </button>
+                </div>
+                <div id="shotSelectorContainer" class="shot-selector-container hidden"></div>
+                <div id="aiInsightsBody">
+                    <div class="ai-empty-state">
+                        <div class="ai-empty-icon">🏏</div>
+                        <div>Run a prediction first, then click <strong>Get AI Insights</strong> to get Gemini-powered
+                            coaching analysis.</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- End of shotDetailSection -->
+            </div>
+
+        </section>
+    </main>
+
+    <script src="/static/app.js?v=20260907_multishot_v2"></script>
+</body>
+
+</html>
